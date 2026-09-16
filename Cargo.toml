@@ -1,0 +1,17 @@
+[package]
+name = "dsh-proxy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "dsh mobile access proxy: one port, no TLS, no state, routes by 32-byte bridge key"
+
+[dependencies]
+base64 = "0.22"
+dashmap = "6"
+snow = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
