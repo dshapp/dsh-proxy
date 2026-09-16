@@ -1,47 +1,122 @@
-//! Noise_XX responder and the length-prefixed transport used with bridges.
+//! Noise_XX responder, and the codec that carries mux frames over it.
 //!
 //! The proxy never decrypts application traffic: this is only the bridge link,
 //! whose handshake is also the bridge's proof of holding its static key.
+//!
+//! Transport state is `snow::StatelessTransportState`, whose seal/open take
+//! `&self` and an explicit nonce. Each direction is owned by one task with its
+//! own counter, so the two directions never share a lock and never contend.
 
 use std::io::{Error, ErrorKind, Result};
-use std::sync::Mutex;
+use std::sync::Arc;
 
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::codec::{Decoder, Encoder};
 
-use crate::wire::{MAX_NOISE_MSG, NOISE_XX};
+use crate::mux::Frame;
+use crate::wire::{FRAME_HEAD, MAX_NOISE_MSG, MAX_PAYLOAD, NOISE_XX, TAG_LEN};
 
 fn bad(error: impl ToString) -> Error {
     Error::new(ErrorKind::InvalidData, error.to_string())
 }
 
-/// Sendable Noise transport: the socket halves stay outside the lock, so the
-/// mutex is held only for the microseconds of one AEAD operation.
-pub struct NoiseTransport {
-    inner: Mutex<snow::TransportState>,
+/// Seals mux frames onto the bridge link. Owns the sending nonce.
+pub struct NoiseEncoder {
+    transport: Arc<StatelessTransportState>,
+    nonce: u64,
+    /// Reused plaintext staging buffer: no allocation per frame.
+    scratch: Vec<u8>,
 }
 
-impl NoiseTransport {
-    /// Seal one plaintext message.
-    pub fn encrypt(&self, plain: &[u8]) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; plain.len() + 16];
-        let mut state = self.inner.lock().map_err(bad)?;
-        let n = state.write_message(plain, &mut out).map_err(bad)?;
-        out.truncate(n);
-        Ok(out)
-    }
+/// Opens mux frames arriving from the bridge. Owns the receiving nonce.
+pub struct NoiseDecoder {
+    transport: Arc<StatelessTransportState>,
+    nonce: u64,
+}
 
-    /// Open one ciphertext message.
-    pub fn decrypt(&self, cipher: &[u8]) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; cipher.len()];
-        let mut state = self.inner.lock().map_err(bad)?;
-        let n = state.read_message(cipher, &mut out).map_err(bad)?;
-        out.truncate(n);
-        Ok(out)
+/// Split one finished handshake into the two halves of the link.
+pub fn codecs(transport: StatelessTransportState) -> (NoiseDecoder, NoiseEncoder) {
+    let transport = Arc::new(transport);
+    (
+        NoiseDecoder { transport: transport.clone(), nonce: 0 },
+        NoiseEncoder {
+            transport,
+            nonce: 0,
+            scratch: Vec::with_capacity(FRAME_HEAD + MAX_PAYLOAD),
+        },
+    )
+}
+
+impl Encoder<Frame> for NoiseEncoder {
+    type Error = Error;
+
+    /// Encode and seal straight into the `Framed` write buffer: the frame
+    /// header, the AEAD output and the length prefix all land in one buffer,
+    /// so a frame costs no allocation of its own.
+    fn encode(&mut self, frame: Frame, dst: &mut BytesMut) -> Result<()> {
+        self.scratch.clear();
+        self.scratch.put_u32(frame.id);
+        self.scratch.put_u8(frame.kind);
+        self.scratch.put_u16(frame.payload.len() as u16);
+        self.scratch.put_u8(0);
+        self.scratch.extend_from_slice(&frame.payload);
+
+        let sealed = self.scratch.len() + TAG_LEN;
+        if sealed > MAX_NOISE_MSG {
+            return Err(bad("noise message too large"));
+        }
+        dst.reserve(2 + sealed);
+        dst.put_u16(sealed as u16);
+        let start = dst.len();
+        dst.resize(start + sealed, 0);
+        let n = self
+            .transport
+            .write_message(self.nonce, &self.scratch, &mut dst[start..])
+            .map_err(bad)?;
+        dst.truncate(start + n);
+        self.nonce += 1;
+        Ok(())
     }
 }
 
-/// Read one `[u16 len][data]` frame.
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+impl Decoder for NoiseDecoder {
+    type Item = Bytes;
+    type Error = Error;
+
+    /// `Framed` hands us a buffer it filled with large reads, so a frame no
+    /// longer costs its own pair of syscalls.
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Bytes>> {
+        if src.len() < 2 {
+            src.reserve(2);
+            return Ok(None);
+        }
+        let len = u16::from_be_bytes([src[0], src[1]]) as usize;
+        if len < TAG_LEN {
+            return Err(bad("short noise message"));
+        }
+        if src.len() < 2 + len {
+            src.reserve(2 + len - src.len());
+            return Ok(None);
+        }
+        src.advance(2);
+        let sealed = src.split_to(len);
+
+        let mut plain = BytesMut::zeroed(len - TAG_LEN);
+        let n = self
+            .transport
+            .read_message(self.nonce, &sealed, &mut plain)
+            .map_err(bad)?;
+        self.nonce += 1;
+        plain.truncate(n);
+        Ok(Some(plain.freeze()))
+    }
+}
+
+/// Read one `[u16 len][data]` frame. Handshake only — three messages, before
+/// the link is framed, so it reads exactly and buffers nothing.
+async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len = [0u8; 2];
     reader.read_exact(&mut len).await?;
     let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
@@ -49,8 +124,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>>
     Ok(body)
 }
 
-/// Write one `[u16 len][data]` frame.
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<()> {
+/// Write one `[u16 len][data]` frame. Handshake only.
+async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<()> {
     if body.len() > MAX_NOISE_MSG {
         return Err(bad("noise message too large"));
     }
@@ -69,7 +144,7 @@ pub async fn xx_respond<S: AsyncRead + AsyncWrite + Unpin>(
     socket: &mut S,
     private_key: &[u8],
     prologue: &[u8],
-) -> Result<([u8; 32], NoiseTransport)> {
+) -> Result<([u8; 32], StatelessTransportState)> {
     let params = NOISE_XX.parse().map_err(bad)?;
     let mut handshake = snow::Builder::new(params)
         .local_private_key(private_key)
@@ -89,8 +164,8 @@ pub async fn xx_respond<S: AsyncRead + AsyncWrite + Unpin>(
         .get_remote_static()
         .ok_or_else(|| bad("bridge sent no static key"))?;
     let key: [u8; 32] = remote.try_into().map_err(|_| bad("bad static key length"))?;
-    let transport = handshake.into_transport_mode().map_err(bad)?;
-    Ok((key, NoiseTransport { inner: Mutex::new(transport) }))
+    let transport = handshake.into_stateless_transport_mode().map_err(bad)?;
+    Ok((key, transport))
 }
 
 /// Generate an X25519 static key pair.
@@ -101,12 +176,23 @@ pub fn generate_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Derive the public key of a stored private key.
-pub fn public_key_of(private_key: &[u8]) -> Result<Vec<u8>> {
-    use snow::params::DHChoice;
-    use snow::resolvers::{CryptoResolver, DefaultResolver};
-    let mut dh = DefaultResolver
-        .resolve_dh(&DHChoice::Curve25519)
-        .ok_or_else(|| bad("no x25519 backend"))?;
-    dh.set(private_key);
-    Ok(dh.pubkey().to_vec())
+pub fn public_key_of(private_key: &[u8]) -> Result<[u8; 32]> {
+    let bytes: [u8; 32] = private_key
+        .try_into()
+        .map_err(|_| bad("private key must be 32 bytes"))?;
+    let secret = x25519_dalek::StaticSecret::from(bytes);
+    Ok(x25519_dalek::PublicKey::from(&secret).to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    /// snow and x25519-dalek must agree, or a bridge would pin a key the proxy
+    /// never proves.
+    #[test]
+    fn public_key_matches_snow() {
+        for _ in 0..16 {
+            let (private, public) = super::generate_keypair().unwrap();
+            assert_eq!(super::public_key_of(&private).unwrap().to_vec(), public);
+        }
+    }
 }

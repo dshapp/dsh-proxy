@@ -39,6 +39,11 @@ so a bridge can pin it. Local development:
 ./target/release/dsh-proxy --listen 127.0.0.1:8787
 ```
 
+`cargo test` runs the suite in `tests/tunnel.rs`, which drives a real proxy
+over loopback with an independent bridge written against PROTOCOL.md: round
+trip, 3 MiB bulk transfer through the window, 50 concurrent streams,
+keepalive echo, and the silent drops for unknown key, version and magic.
+
 ## Measured
 
 One M-series Mac running proxy, bridge and load generator together (so these

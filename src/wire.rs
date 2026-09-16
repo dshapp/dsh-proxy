@@ -14,6 +14,8 @@ pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 
 /// Largest Noise message on the wire (length prefix is u16).
 pub const MAX_NOISE_MSG: usize = 65535;
+/// ChaChaPoly authentication tag.
+pub const TAG_LEN: usize = 16;
 
 /// mux frame kinds.
 pub const KIND_OPEN: u8 = 0;
