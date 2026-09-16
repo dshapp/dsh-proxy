@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: target/x86_64-unknown-linux-musl/release/dsh-proxy
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # musl gives one statically linked file: no glibc version to match on
+      # the server, no shared objects to ship, just scp and run.
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      # A binary that needs an interpreter is not one you can "just run".
+      - name: Check the binary is static and starts
+        run: |
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "::error::binary is dynamically linked"; ldd "$BIN"; exit 1
+          fi
+          ./"$BIN" --help
+          sha256sum "$BIN" | tee dsh-proxy.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-proxy-linux-x86_64
+          path: |
+            ${{ env.BIN }}
+            dsh-proxy.sha256
+          if-no-files-found: error
+          retention-days: 90
