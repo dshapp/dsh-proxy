@@ -43,7 +43,9 @@ jobs:
       - name: Check the binary is static and starts
         run: |
           file "$BIN"
-          if ldd "$BIN" 2>&1 | grep -qv 'not a dynamic executable'; then
+          # ldd words a static binary two ways: glibc's says "statically
+          # linked", musl's says "not a dynamic executable". Neither is a fault.
+          if ldd "$BIN" 2>&1 | grep -qvE 'not a dynamic executable|statically linked'; then
             echo "::error::binary is dynamically linked"; ldd "$BIN"; exit 1
           fi
           ./"$BIN" --help
