@@ -14,6 +14,9 @@ pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 
 /// Largest Noise message on the wire (length prefix is u16).
 pub const MAX_NOISE_MSG: usize = 65535;
+/// Largest message allowed during the handshake, before a peer is trusted.
+/// The three XX messages are a few hundred bytes; 64 KiB is not.
+pub const MAX_HANDSHAKE_MSG: usize = 1024;
 /// ChaChaPoly authentication tag.
 pub const TAG_LEN: usize = 16;
 
@@ -29,3 +32,8 @@ pub const FRAME_HEAD: usize = 8;
 pub const MAX_PAYLOAD: usize = 16384;
 /// Per-stream receive window.
 pub const WINDOW: u32 = 256 * 1024;
+
+/// Resource guard, not authentication: one bridge cannot be made to hold
+/// unbounded state by whoever knows its public key. A phone keeps a live
+/// socket plus a small connection pool, so this is thousands of phones.
+pub const MAX_STREAMS_PER_BRIDGE: usize = 2048;

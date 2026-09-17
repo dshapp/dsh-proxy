@@ -1,25 +1,42 @@
-//! Command line entry point: parse two flags, bind one port, serve.
+//! Command line entry point: parse a few flags, bind one port, serve.
 
 use std::io::Result;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use tokio::net::TcpListener;
 
-use dsh_proxy::noise;
+use dsh_proxy::{noise, Limits};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut listen = "0.0.0.0:443".to_string();
     let mut key: Option<String> = None;
+    let mut limits = Limits::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next().unwrap_or(listen),
             "--key" => key = args.next(),
+            "--max-bridges" => limits.max_bridges = positive(&mut args, "--max-bridges"),
+            "--max-bridges-per-ip" => {
+                limits.max_bridges_per_ip = positive(&mut args, "--max-bridges-per-ip")
+            }
+            "--max-streams-per-bridge" => {
+                limits.max_streams_per_bridge = positive(&mut args, "--max-streams-per-bridge")
+            }
+            "--handshake-timeout-ms" => {
+                limits.handshake_timeout =
+                    Duration::from_millis(positive(&mut args, "--handshake-timeout-ms") as u64)
+            }
             "--help" | "-h" => {
-                eprintln!("dsh-proxy [--listen HOST:PORT] [--key BASE64_X25519_PRIVATE]");
+                eprintln!(
+                    "dsh-proxy [--listen HOST:PORT] [--key BASE64_X25519_PRIVATE]\n\
+                     \t[--max-bridges N] [--max-bridges-per-ip N]\n\
+                     \t[--max-streams-per-bridge N] [--handshake-timeout-ms N]"
+                );
                 return Ok(());
             }
             other => {
@@ -42,5 +59,16 @@ async fn main() -> Result<()> {
     eprintln!("dsh-proxy listening on {listen}");
     eprintln!("dsh-proxy public key {}", B64.encode(public));
 
-    dsh_proxy::run(listener, Arc::new(private)).await
+    dsh_proxy::run(listener, Arc::new(private), limits).await
+}
+
+/// Read the next argument as a positive integer, or exit with a usage error.
+fn positive(args: &mut impl Iterator<Item = String>, flag: &str) -> usize {
+    match args.next().map(|value| value.parse::<usize>()) {
+        Some(Ok(value)) if value > 0 => value,
+        _ => {
+            eprintln!("dsh-proxy: {flag} needs a positive integer");
+            std::process::exit(2);
+        }
+    }
 }

@@ -39,10 +39,27 @@ so a bridge can pin it. Local development:
 ./target/release/dsh-proxy --listen 127.0.0.1:8787
 ```
 
+Registration is deliberately unauthenticated — a bridge proves its static key
+with the handshake itself and there is nothing to check it against — so the
+process bounds what any one peer can make it hold:
+
+| flag | default | bounds |
+|---|---|---|
+| `--max-bridges` | 1024 | bridge links held at once, process-wide |
+| `--max-bridges-per-ip` | 32 | bridge links held by one peer address |
+| `--max-streams-per-bridge` | 2048 | phone streams one bridge carries at once |
+| `--handshake-timeout-ms` | 10000 | a bridge's whole XX handshake, not just its preamble |
+
+Over either bridge ceiling the connection is dropped mid-handshake with no
+reply. The per-IP default fits an ordinary NAT; behind an L4 load balancer,
+where every peer looks like one address, raise it deliberately.
+
 `cargo test` runs the suite in `tests/tunnel.rs`, which drives a real proxy
 over loopback with an independent bridge written against PROTOCOL.md: round
 trip, 3 MiB bulk transfer through the window, 50 concurrent streams,
-keepalive echo, and the silent drops for unknown key, version and magic.
+keepalive echo, the silent drops for unknown key, version and magic, and the
+admission limits — per-IP refusal, stalled-handshake reaping, the exact stream
+budget under a race, and one stream's flood costing only that stream.
 
 ## Measured
 
@@ -58,5 +75,6 @@ are floors, not ceilings), against 100–300 simulated phones:
 | bulk transfer | 36 MiB/s down (paged transcripts), 141 MiB/s up |
 | proxy memory | ~5 MB RSS with 400 streams, flat across runs |
 
-Per-bridge stream ceiling is `MAX_STREAMS_PER_BRIDGE` (2048); over it, new
-phone connections are dropped without touching the bridge link.
+Per-bridge stream ceiling is `MAX_STREAMS_PER_BRIDGE` (2048, `--max-streams-per-bridge`);
+over it, new phone connections are dropped without touching the bridge link. A
+stream that writes past its receive window loses that stream, not the link.

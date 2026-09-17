@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::mux::Frame;
-use crate::wire::{FRAME_HEAD, MAX_NOISE_MSG, MAX_PAYLOAD, NOISE_XX, TAG_LEN};
+use crate::wire::{FRAME_HEAD, MAX_HANDSHAKE_MSG, MAX_NOISE_MSG, MAX_PAYLOAD, NOISE_XX, TAG_LEN};
 
 fn bad(error: impl ToString) -> Error {
     Error::new(ErrorKind::InvalidData, error.to_string())
@@ -116,18 +116,26 @@ impl Decoder for NoiseDecoder {
 
 /// Read one `[u16 len][data]` frame. Handshake only — three messages, before
 /// the link is framed, so it reads exactly and buffers nothing.
+///
+/// The length is attacker-controlled, so it is checked against the handshake
+/// ceiling *before* allocating: an unauthenticated peer must not be able to
+/// name a 64 KiB buffer per connection.
 async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len = [0u8; 2];
     reader.read_exact(&mut len).await?;
-    let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
+    let len = u16::from_be_bytes(len) as usize;
+    if len > MAX_HANDSHAKE_MSG {
+        return Err(bad("handshake message too large"));
+    }
+    let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(body)
 }
 
 /// Write one `[u16 len][data]` frame. Handshake only.
 async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<()> {
-    if body.len() > MAX_NOISE_MSG {
-        return Err(bad("noise message too large"));
+    if body.len() > MAX_HANDSHAKE_MSG {
+        return Err(bad("handshake message too large"));
     }
     let mut out = Vec::with_capacity(body.len() + 2);
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -152,7 +160,9 @@ pub async fn xx_respond<S: AsyncRead + AsyncWrite + Unpin>(
         .build_responder()
         .map_err(bad)?;
 
-    let mut buf = vec![0u8; MAX_NOISE_MSG];
+    // XX's three messages are a few hundred bytes at most; the transport
+    // ceiling is for the mux that follows, not for this.
+    let mut buf = vec![0u8; MAX_HANDSHAKE_MSG];
     let msg1 = read_frame(socket).await?;
     handshake.read_message(&msg1, &mut buf).map_err(bad)?;
     let n = handshake.write_message(&[], &mut buf).map_err(bad)?;

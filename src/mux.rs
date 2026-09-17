@@ -12,19 +12,25 @@ use bytes::{Buf, Bytes};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::noise::{NoiseDecoder, NoiseEncoder};
-use crate::wire::{FRAME_HEAD, KIND_CLOSE, KIND_DATA, KIND_OPEN, KIND_WINDOW, MAX_PAYLOAD, WINDOW};
+use crate::wire::{
+    FRAME_HEAD, KIND_CLOSE, KIND_DATA, KIND_OPEN, KIND_WINDOW, MAX_PAYLOAD, WINDOW,
+};
 
 /// Silence longer than this ends the session; the bridge pings every 30s.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// Frames a stream may hold before dispatch would block. The window bounds
-/// bytes, not frame count, so this is sized for small frames rather than for
-/// `WINDOW / MAX_PAYLOAD`.
+/// Frames a stream may hold before dispatch would block.
+///
+/// The real bound on a stream is its byte window, which the bridge may not
+/// exceed; this is sized for the worst case of many small frames inside one
+/// window rather than for `WINDOW / MAX_PAYLOAD`. Overflow therefore means a
+/// peer that ignored its credit, and it now costs that one stream — see the
+/// `Full` arm of `read_loop` — instead of the whole link.
 const INBOX_FRAMES: usize = 1024;
 /// Frames the writer coalesces into one buffer before flushing. One `/api`
 /// call is several small frames; packing them costs one syscall, not six.
@@ -49,6 +55,10 @@ struct StreamState {
     inbox: mpsc::Sender<Bytes>,
     /// Credit we still hold for sending to the bridge.
     credit: Arc<Semaphore>,
+    /// One slot of this bridge's stream budget, held for the stream's life.
+    /// Reserving here rather than checking before insertion is what makes the
+    /// per-bridge ceiling exact under concurrency.
+    _budget: OwnedSemaphorePermit,
 }
 
 /// One live bridge link and every stream riding it.
@@ -56,16 +66,24 @@ pub struct MuxSession {
     out: mpsc::Sender<Frame>,
     streams: DashMap<u32, StreamState>,
     next_id: AtomicU32,
+    /// This bridge's stream ceiling, as a permit pool.
+    budget: Arc<Semaphore>,
 }
 
 impl MuxSession {
     /// Take over an authenticated bridge link; the handle resolves when it dies.
-    pub fn start(reader: LinkReader, mut writer: LinkWriter) -> (Arc<Self>, JoinHandle<()>) {
+    /// @param max_streams - concurrent stream ceiling for this link.
+    pub fn start(
+        reader: LinkReader,
+        mut writer: LinkWriter,
+        max_streams: usize,
+    ) -> (Arc<Self>, JoinHandle<()>) {
         let (out, mut outbox) = mpsc::channel::<Frame>(256);
         let session = Arc::new(Self {
             out,
             streams: DashMap::new(),
             next_id: AtomicU32::new(1),
+            budget: Arc::new(Semaphore::new(max_streams.max(1))),
         });
 
         let writer_task = tokio::spawn(async move {
@@ -101,14 +119,26 @@ impl MuxSession {
         self.streams.len()
     }
 
-    /// Open one stream for an incoming mobile connection.
-    pub async fn open_stream(self: &Arc<Self>) -> Result<(StreamTx, StreamRx)> {
+    /// Open one stream for an incoming mobile connection, if the bridge has
+    /// budget left.
+    ///
+    /// The slot is taken before anything is inserted or sent, so the ceiling
+    /// holds no matter how many clients arrive at once; a plain length check
+    /// followed by a separate insert would let concurrent callers overshoot.
+    /// @returns the stream halves, or `None` once this bridge is full.
+    pub async fn try_open_stream(self: &Arc<Self>) -> Option<(StreamTx, StreamRx)> {
+        let budget = self.budget.clone().try_acquire_owned().ok()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (inbox, rx) = mpsc::channel::<Bytes>(INBOX_FRAMES);
         let credit = Arc::new(Semaphore::new(WINDOW as usize));
-        self.streams.insert(id, StreamState { inbox, credit: credit.clone() });
-        self.send(Frame::control(id, KIND_OPEN)).await?;
-        Ok((StreamTx { id, session: self.clone(), credit }, StreamRx { rx }))
+        self.streams.insert(id, StreamState { inbox, credit: credit.clone(), _budget: budget });
+        if self.send(Frame::control(id, KIND_OPEN)).await.is_err() {
+            // The link died between reserving and announcing: release the slot
+            // rather than leaking it for the life of the process.
+            self.streams.remove(&id);
+            return None;
+        }
+        Some((StreamTx { id, session: self.clone(), credit }, StreamRx { rx }))
     }
 
     async fn send(&self, frame: Frame) -> Result<()> {
@@ -150,12 +180,15 @@ impl MuxSession {
                             // else and must survive it.
                             Err(mpsc::error::TrySendError::Closed(_)) => {}
                             // Full means the bridge wrote past the window it
-                            // was granted, which is a broken peer.
+                            // was granted. That is a broken peer, but only on
+                            // this stream: hanging up the whole link would let
+                            // one bad stream take every phone on this bridge
+                            // down with it.
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                return Err(Error::new(
-                                    ErrorKind::InvalidData,
-                                    "receive window exceeded",
-                                ));
+                                if let Some((_, state)) = self.streams.remove(&id) {
+                                    state.credit.close();
+                                }
+                                self.send(Frame::control(id, KIND_CLOSE)).await?;
                             }
                         }
                     }
