@@ -16,7 +16,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::mux::Frame;
-use crate::wire::{FRAME_HEAD, MAX_HANDSHAKE_MSG, MAX_NOISE_MSG, MAX_PAYLOAD, NOISE_XX, TAG_LEN};
+use crate::wire::{
+    FRAME_HEAD, MAX_HANDSHAKE_MSG, MAX_NOISE_MSG, MAX_PAYLOAD, NOISE_IK, NOISE_XX, TAG_LEN,
+};
 
 fn bad(error: impl ToString) -> Error {
     Error::new(ErrorKind::InvalidData, error.to_string())
@@ -133,6 +135,11 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
 }
 
 /// Write one `[u16 len][data]` frame. Handshake only.
+///
+/// The explicit flush matters: a handshake frame is a few hundred bytes, while
+/// a buffering transport (the proxy's mux stream) only emits on flush or once
+/// its buffer fills. Without it the handshake would sit in the buffer, the two
+/// ends would wait on each other, and the tunnel would never come up.
 async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Result<()> {
     if body.len() > MAX_HANDSHAKE_MSG {
         return Err(bad("handshake message too large"));
@@ -140,7 +147,8 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, body: &[u8]) -> Resu
     let mut out = Vec::with_capacity(body.len() + 2);
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(body);
-    writer.write_all(&out).await
+    writer.write_all(&out).await?;
+    writer.flush().await
 }
 
 /// Respond to a bridge's Noise_XX handshake.
@@ -176,6 +184,92 @@ pub async fn xx_respond<S: AsyncRead + AsyncWrite + Unpin>(
     let key: [u8; 32] = remote.try_into().map_err(|_| bad("bad static key length"))?;
     let transport = handshake.into_stateless_transport_mode().map_err(bad)?;
     Ok((key, transport))
+}
+
+/// Drive the *phone* side of a Noise_IK handshake with a bridge.
+///
+/// This is the proxy standing in for a paired device: it presents a device
+/// static key the bridge has whitelisted (or a one-shot pairing token, in the
+/// first message's payload), and verifies the bridge's static key against the
+/// routing key in the preamble. Nothing else changes on the bridge — it sees
+/// an ordinary phone and runs its existing IK responder unchanged.
+///
+/// @param device_private - the device's 32-byte X25519 static private key.
+/// @param bridge_public - the bridge's 32-byte static public key (bridgeKey).
+/// @param prologue - the exact 37-byte preamble that was written to the wire.
+/// @param first_payload - pairing token on first contact, empty afterwards.
+pub async fn ik_initiate<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
+    device_private: &[u8],
+    bridge_public: &[u8],
+    prologue: &[u8],
+    first_payload: &[u8],
+) -> Result<StatelessTransportState> {
+    let params = NOISE_IK.parse().map_err(bad)?;
+    let mut handshake = snow::Builder::new(params)
+        .local_private_key(device_private)
+        .remote_public_key(bridge_public)
+        .prologue(prologue)
+        .build_initiator()
+        .map_err(bad)?;
+
+    let mut buf = vec![0u8; MAX_HANDSHAKE_MSG];
+    let n = handshake.write_message(first_payload, &mut buf).map_err(bad)?;
+    write_frame(socket, &buf[..n]).await?;
+    let msg2 = read_frame(socket).await?;
+    handshake.read_message(&msg2, &mut buf).map_err(bad)?;
+
+    // IK already proves the responder to us, but assert the identity anyway:
+    // a bridge that answered with the wrong static key is not our bridge.
+    match handshake.get_remote_static() {
+        Some(remote) if remote == bridge_public => {}
+        Some(_) => return Err(bad("bridge proved an unexpected static key")),
+        None => return Err(bad("bridge sent no static key")),
+    }
+    handshake.into_stateless_transport_mode().map_err(bad)
+}
+
+/// Respond to a device's Noise_IK handshake — the bridge's side of the same
+/// protocol the proxy initiates above.
+///
+/// This is what a real bridge runs; it lives here so the loopback harness is an
+/// independent implementation of the peer rather than a second copy of the
+/// proxy's own code.
+///
+/// @returns the device's static public key, the first message's payload (the
+/// pairing token on first contact) and the finished transport.
+pub async fn ik_respond<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
+    bridge_private: &[u8],
+    prologue: &[u8],
+) -> Result<([u8; 32], Vec<u8>, StatelessTransportState)> {
+    let params = NOISE_IK.parse().map_err(bad)?;
+    let mut handshake = snow::Builder::new(params)
+        .local_private_key(bridge_private)
+        .prologue(prologue)
+        .build_responder()
+        .map_err(bad)?;
+
+    // IK's first message carries the initiator's static key and its payload;
+    // the second is the responder's only flight.
+    let mut buf = vec![0u8; MAX_HANDSHAKE_MSG];
+    let msg1 = read_frame(socket).await?;
+    let mut payload = vec![0u8; MAX_HANDSHAKE_MSG];
+    let n = handshake
+        .read_message(&msg1, &mut payload)
+        .map_err(bad)?;
+    payload.truncate(n);
+
+    let remote = handshake
+        .get_remote_static()
+        .ok_or_else(|| bad("device sent no static key"))?;
+    let key: [u8; 32] = remote.try_into().map_err(|_| bad("bad static key length"))?;
+
+    let n = handshake.write_message(&[], &mut buf).map_err(bad)?;
+    write_frame(socket, &buf[..n]).await?;
+
+    let transport = handshake.into_stateless_transport_mode().map_err(bad)?;
+    Ok((key, payload, transport))
 }
 
 /// Generate an X25519 static key pair.

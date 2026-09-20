@@ -11,6 +11,9 @@ pub const HEAD_LEN: usize = 37;
 
 /// Noise suite spoken by bridges.
 pub const NOISE_XX: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
+/// Noise suite spoken by phones. The proxy now terminates TLS for every phone
+/// and speaks IK on its behalf, so this direction lives here too.
+pub const NOISE_IK: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
 /// Largest Noise message on the wire (length prefix is u16).
 pub const MAX_NOISE_MSG: usize = 65535;

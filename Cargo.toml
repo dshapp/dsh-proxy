@@ -3,22 +3,33 @@ name = "dsh-proxy"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "dsh mobile access proxy: one port, no TLS, no state, routes by 32-byte bridge key"
+description = "dsh mobile access proxy: one port, TLS for every client, routes by 32-byte bridge key"
 
 [dependencies]
 base64 = "0.22"
 bytes = "1"
 dashmap = "6"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = "0.14"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # ring-accelerated: ring's assembly ChaChaPoly/SHA256 backend for the bridge
 # link. Measured 3x faster than the pure-Rust default at our 16 KiB frame.
 snow = { version = "0.9", features = ["ring-accelerated"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 
 [profile.release]
 opt-level = 3

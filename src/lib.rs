@@ -5,8 +5,13 @@
 //! (Noise_XX) or splices a mobile connection onto the addressed bridge's mux.
 //! Application bytes are never parsed, never decrypted, never stored.
 
+pub mod edge;
 pub mod mux;
 pub mod noise;
+pub mod phone;
+pub mod state;
+pub mod tls;
+pub mod tunnel;
 pub mod wire;
 
 use std::io::Result;
@@ -119,6 +124,46 @@ pub async fn run(listener: TcpListener, private: Arc<Vec<u8>>, limits: Limits) -
         tokio::spawn(async move {
             let _ = socket.set_nodelay(true);
             let _ = serve(socket, peer.ip(), table, per_ip, budget, private, limits).await;
+        });
+    }
+}
+
+/// Serve the unified client edge alongside bridge links on one port.
+///
+/// A TLS ClientHello starts with 0x16 and a preamble starts with 'D', so one
+/// byte decides the branch without consuming it. Everything past that byte is
+/// either a bridge (unchanged, Noise_XX) or a TLS client (the edge).
+pub async fn run_edge(
+    listener: TcpListener,
+    private: Arc<Vec<u8>>,
+    limits: Limits,
+    edge: Arc<edge::Edge>,
+) -> Result<()> {
+    let table = edge.table.clone();
+    let per_ip: BridgesPerIp = Arc::new(DashMap::new());
+    let budget = Arc::new(Semaphore::new(limits.max_bridges));
+    loop {
+        let (socket, peer) = listener.accept().await?;
+        let _ = socket.set_nodelay(true);
+        let table = table.clone();
+        let per_ip = per_ip.clone();
+        let budget = budget.clone();
+        let private = private.clone();
+        let edge = edge.clone();
+        tokio::spawn(async move {
+            let mut first = [0u8; 1];
+            let tls = match timeout(PREAMBLE_TIMEOUT, socket.peek(&mut first)).await {
+                Ok(Ok(1)) => first[0] == 0x16,
+                _ => {
+                    // Nothing arrived: not a client of ours either way.
+                    return;
+                }
+            };
+            if tls {
+                edge.serve(socket).await;
+            } else {
+                let _ = serve(socket, peer.ip(), table, per_ip, budget, private, limits).await;
+            }
         });
     }
 }
