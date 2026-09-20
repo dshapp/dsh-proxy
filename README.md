@@ -59,7 +59,8 @@ over loopback with an independent bridge written against PROTOCOL.md: round
 trip, 3 MiB bulk transfer through the window, 50 concurrent streams,
 keepalive echo, the silent drops for unknown key, version and magic, and the
 admission limits — per-IP refusal, stalled-handshake reaping, the exact stream
-budget under a race, and one stream's flood costing only that stream.
+budget under a race, one stream's flood costing only that stream, and duplicate
+registration closing the link it displaces rather than hiding it.
 
 ## Measured
 
