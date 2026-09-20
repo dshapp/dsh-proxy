@@ -5,7 +5,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -68,6 +68,10 @@ pub struct MuxSession {
     next_id: AtomicU32,
     /// This bridge's stream ceiling, as a permit pool.
     budget: Arc<Semaphore>,
+    /// Both tasks carrying this link, so a session displaced by a duplicate
+    /// registration can be torn down from outside. Set once, right after
+    /// `start` spawns them.
+    tasks: OnceLock<(AbortHandle, AbortHandle)>,
 }
 
 impl MuxSession {
@@ -84,6 +88,7 @@ impl MuxSession {
             streams: DashMap::new(),
             next_id: AtomicU32::new(1),
             budget: Arc::new(Semaphore::new(max_streams.max(1))),
+            tasks: OnceLock::new(),
         });
 
         let writer_task = tokio::spawn(async move {
@@ -101,6 +106,9 @@ impl MuxSession {
             }
         });
 
+        let writer_abort = writer_task.abort_handle();
+        let writer_abort_on_death = writer_abort.clone();
+
         let reading = session.clone();
         let handle = tokio::spawn(async move {
             let _ = reading.read_loop(reader).await;
@@ -109,14 +117,36 @@ impl MuxSession {
                 state.credit.close();
                 false
             });
-            writer_task.abort();
+            writer_abort_on_death.abort();
         });
+        // Both halves are abortable from outside, so a session displaced by a
+        // duplicate registration can be torn down by whoever displaced it.
+        let _ = session.tasks.set((handle.abort_handle(), writer_abort));
         (session, handle)
     }
 
     /// Streams currently riding this link.
     pub fn stream_count(&self) -> usize {
         self.streams.len()
+    }
+
+    /// Tear this link down unconditionally.
+    ///
+    /// Used when a duplicate registration takes over its routing key: the
+    /// displaced link is no longer addressable, so leaving it open would keep
+    /// a socket whose keepalives still flow but which no phone can ever reach.
+    /// Closing the credit gate first wakes senders parked on stream windows;
+    /// aborting both tasks then closes the socket, which is what tells the
+    /// other end to reconnect.
+    pub fn shutdown(&self) {
+        self.streams.retain(|_, state| {
+            state.credit.close();
+            false
+        });
+        if let Some((reader, writer)) = self.tasks.get() {
+            reader.abort();
+            writer.abort();
+        }
     }
 
     /// Open one stream for an incoming mobile connection, if the bridge has

@@ -292,6 +292,76 @@ async fn keepalive_is_echoed() {
     assert_eq!((id, kind, body.len()), (0, KIND_DATA, 0));
 }
 
+/// Spawn an echo bridge and a signal that fires when its link dies.
+async fn spawn_echo_bridge(
+    addr: SocketAddr,
+    private: &[u8],
+) -> (tokio::sync::oneshot::Receiver<()>, tokio::task::JoinHandle<()>) {
+    let bridge = EchoBridge::connect(addr, private).await;
+    let (dead_tx, dead_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        bridge.run().await;
+        let _ = dead_tx.send(());
+    });
+    (dead_rx, handle)
+}
+
+/// One phone: dial the key and confirm the preamble plus its body come back.
+async fn phone_echos_body(addr: SocketAddr, key: &[u8], body: &[u8]) -> bool {
+    let Some(mut phone) = TcpStream::connect(addr).await.ok() else { return false };
+    if phone.write_all(&preamble(b"DSHC", 1, key)).await.is_err() {
+        return false;
+    }
+    if phone.write_all(body).await.is_err() {
+        return false;
+    }
+    let mut got = vec![0u8; 37 + body.len()];
+    let Ok(result) = tokio::time::timeout(Duration::from_secs(5), phone.read_exact(&mut got)).await
+    else {
+        return false;
+    };
+    result.is_ok() && got[37..] == *body
+}
+
+/// A second registration for the same key must not orphan the first link.
+///
+/// The proxy used to overwrite the routing entry and leave the displaced link
+/// open. Its socket stayed alive and its keepalives kept being echoed, so its
+/// bridge never reconnected, yet no phone could reach it; and when the newer
+/// link later disconnected, its cleanup deleted the only entry and stranded
+/// that bridge for good. A registration that displaces a live link must close
+/// it instead, so the displaced bridge reconnects and re-registers.
+#[tokio::test]
+async fn duplicate_registration_replaces_the_link() {
+    let addr = start_proxy().await;
+    let (private, public) = dsh_proxy::noise::generate_keypair().unwrap();
+    let body = "duplicate-registration-body".repeat(8).into_bytes();
+
+    // Link A registers the key and answers a phone.
+    let (a_dead, _a_handle) = spawn_echo_bridge(addr, &private).await;
+    assert!(phone_echos_body(addr, &public, &body).await, "first link never worked");
+
+    // Link B proves the same key and takes the route over.
+    let (b_dead, b_handle) = spawn_echo_bridge(addr, &private).await;
+
+    // A is no longer addressable, so the proxy must close it rather than keep a
+    // hidden socket alive. The bridge sees the close as a dead link.
+    tokio::time::timeout(Duration::from_secs(10), a_dead)
+        .await
+        .expect("the displaced link was left open forever")
+        .expect("the displaced link's task vanished");
+
+    // The key now routes to the newest link, and still works.
+    assert!(phone_echos_body(addr, &public, &body).await, "the newest link is unreachable");
+
+    // When the newer link dies too, the key must route nowhere: the old link is
+    // gone, so there is no phantom session left answering for it.
+    b_handle.abort();
+    let _ = b_dead.await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!phone_echos_body(addr, &public, &body).await, "a dead link still answered");
+}
+
 #[tokio::test]
 async fn unknown_bridge_key_is_dropped() {
     let addr = start_proxy().await;

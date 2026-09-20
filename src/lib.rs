@@ -185,7 +185,17 @@ async fn serve_bridge(
     // The key is a routing label, not a secret: whoever holds the QR code has
     // it, so writing it to a log only spreads it further.
     eprintln!("bridge up");
-    table.insert(bridge_key, session.clone());
+    // A second link proving the same key must take over the route — but the
+    // link it displaces cannot simply be forgotten. Its socket stays open and
+    // the proxy keeps echoing its keepalives, so the bridge on the other end
+    // still believes it is connected and never reconnects, while no phone can
+    // reach it; and if this newer link then dies, its own disconnect would
+    // delete the only entry and strand that bridge for good. Tearing the
+    // displaced session down closes its socket, which is the signal that makes
+    // its bridge dial again and re-register as the newest link.
+    if let Some(previous) = table.insert(bridge_key, session.clone()) {
+        previous.shutdown();
+    }
     let _ = done.await;
     // Only drop the entry if a later generation has not replaced it.
     table.remove_if(&bridge_key, |_, current| Arc::ptr_eq(current, &session));
