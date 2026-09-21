@@ -49,6 +49,66 @@ pub fn preamble(bridge_key: &[u8; 32]) -> Vec<u8> {
     head
 }
 
+/// One tunnel to the bridge, with or without the inner Noise_IK layer.
+pub enum Tunnel {
+    /// The shipped shape: HTTP inside Noise_IK inside the Noise_XX mux link.
+    Sealed(NoiseStream<MuxStreamIo>),
+    /// Experimental: HTTP straight on the mux stream, sealed only by the
+    /// bridge link's own Noise_XX.
+    Plain(MuxStreamIo),
+}
+
+/// Whether to drop the inner Noise_IK layer (experiment only).
+pub fn plain_tunnels() -> bool {
+    std::env::var("DSH_TUNNEL_PLAIN").is_ok_and(|value| value == "1")
+}
+
+impl tokio::io::AsyncRead for Tunnel {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<Result<()>> {
+        match self.get_mut() {
+            Tunnel::Sealed(inner) => std::pin::Pin::new(inner).poll_read(cx, buf),
+            Tunnel::Plain(inner) => std::pin::Pin::new(inner).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Tunnel {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<Result<usize>> {
+        match self.get_mut() {
+            Tunnel::Sealed(inner) => std::pin::Pin::new(inner).poll_write(cx, data),
+            Tunnel::Plain(inner) => std::pin::Pin::new(inner).poll_write(cx, data),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<()>> {
+        match self.get_mut() {
+            Tunnel::Sealed(inner) => std::pin::Pin::new(inner).poll_flush(cx),
+            Tunnel::Plain(inner) => std::pin::Pin::new(inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<()>> {
+        match self.get_mut() {
+            Tunnel::Sealed(inner) => std::pin::Pin::new(inner).poll_shutdown(cx),
+            Tunnel::Plain(inner) => std::pin::Pin::new(inner).poll_shutdown(cx),
+        }
+    }
+}
+
 /// One keep-alive HTTP/1.1 connection riding a Noise tunnel.
 struct Conn {
     sender: SendRequest<Body>,
@@ -109,7 +169,7 @@ impl Pool {
         &self,
         route: &DeviceHandle,
         first_payload: &[u8],
-    ) -> Result<NoiseStream<MuxStreamIo>> {
+    ) -> Result<Tunnel> {
         let session = self
             .table
             .get(&route.bridge_key)
@@ -123,6 +183,14 @@ impl Pool {
         tx.send(Bytes::copy_from_slice(&head)).await?;
 
         let mut io = MuxStreamIo::new(tx, rx);
+        // EXPERIMENT (DSH_TUNNEL_PLAIN=1): skip the inner Noise_IK. The mux
+        // link is already Noise_XX between these same two processes, so once
+        // the proxy holds both keys the IK layer is a second AEAD pass over
+        // every byte that protects nothing the XX link does not. Measuring it
+        // is the only way to price removing it.
+        if plain_tunnels() {
+            return Ok(Tunnel::Plain(io));
+        }
         let transport = noise::ik_initiate(
             &mut io,
             &route.private_key,
@@ -131,7 +199,7 @@ impl Pool {
             first_payload,
         )
         .await?;
-        Ok(NoiseStream::new(io, transport))
+        Ok(Tunnel::Sealed(NoiseStream::new(io, transport)))
     }
 
     /// Borrow a pooled HTTP connection, or build one.

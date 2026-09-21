@@ -53,12 +53,48 @@ async fn echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, BoxError>
     Ok(Response::new(Full::new(bytes)))
 }
 
+/// The same endpoint reached the other way: answer 101 and then echo
+/// `[u32 len][payload]` frames on the raw upgraded stream. This is what a
+/// client gets when it opens one WSS pipe instead of one HTTP call per RPC.
+async fn bridge_service(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, BoxError> {
+    if req.headers().get(hyper::header::UPGRADE).is_none() {
+        return echo(req).await;
+    }
+    let upgraded = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        let Ok(upgraded) = upgraded.await else { return };
+        let mut stream = TokioIo::new(upgraded);
+        let mut head = [0u8; 4];
+        loop {
+            if stream.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let mut body = vec![0u8; u32::from_be_bytes(head) as usize];
+            if stream.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            let mut out = Vec::with_capacity(4 + body.len());
+            out.extend_from_slice(&head);
+            out.extend_from_slice(&body);
+            if stream.write_all(&out).await.is_err() || stream.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(Response::builder()
+        .status(101)
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .body(Full::new(Bytes::new()))?)
+}
+
 async fn serve_http<IO>(io: IO)
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if let Err(error) = hyper::server::conn::http1::Builder::new()
-        .serve_connection(TokioIo::new(io), service_fn(echo))
+        .serve_connection(TokioIo::new(io), service_fn(bridge_service))
+        .with_upgrades()
         .await
     {
         eprintln!("bridge: serve_connection ended: {error}");
@@ -107,6 +143,12 @@ async fn attach_bridge(proxy: &str) -> Result<[u8; 32], BoxError> {
             }
             if head[..4] != MAGIC_CLIENT {
                 eprintln!("bridge: bad preamble magic");
+                return;
+            }
+            // EXPERIMENT: with the inner layer removed the bridge trusts the
+            // Noise_XX link it already authenticated, and reads HTTP directly.
+            if dsh_proxy::phone::plain_tunnels() {
+                serve_http(io).await;
                 return;
             }
             let (_device, _token, transport) = match noise::ik_respond(&mut io, &private, &head).await {
@@ -265,6 +307,119 @@ async fn pair(proxy: &str, key: [u8; 32]) -> Result<String, BoxError> {
         .as_str()
         .ok_or_else(|| fail("pair returned no token"))?
         .to_string())
+}
+
+// ------------------------------------------------- new-era client, one WSS pipe
+
+/// One upgraded TLS connection, used as a byte pipe.
+type Spliced = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// Open the WSS pipe: TLS, then one upgrade handshake, then raw bytes.
+///
+/// After the 101 the proxy stops parsing anything: it copies bytes between
+/// this socket and the bridge's mux stream. Every RPC afterwards costs the
+/// proxy one copy, not one HTTP request cycle.
+async fn spliced_connect(proxy: &str, token: &str) -> Result<Spliced, BoxError> {
+    let connector = tokio_rustls::TlsConnector::from(tls_config());
+    let socket = TcpStream::connect(proxy).await?;
+    socket.set_nodelay(true)?;
+    let name = rustls::pki_types::ServerName::try_from("localhost")?;
+    let mut tls = connector.connect(name, socket).await?;
+    let request = format!(
+        "GET /api/remote.mux HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nAuthorization: Bearer {token}\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes()).await?;
+    tls.flush().await?;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        tls.read_exact(&mut byte).await?;
+        head.push(byte[0]);
+    }
+    if !head.starts_with(b"HTTP/1.1 101") {
+        return Err(fail(format!(
+            "upgrade refused: {}",
+            String::from_utf8_lossy(&head).lines().next().unwrap_or("")
+        )));
+    }
+    Ok(tls)
+}
+
+/// One request/response over the pipe, framed by the client itself.
+async fn pipe_round_trip(lane: &mut Spliced, payload: &[u8]) -> Result<usize, BoxError> {
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    lane.write_all(&out).await?;
+    lane.flush().await?;
+    let mut head = [0u8; 4];
+    lane.read_exact(&mut head).await?;
+    let mut body = vec![0u8; u32::from_be_bytes(head) as usize];
+    lane.read_exact(&mut body).await?;
+    Ok(body.len())
+}
+
+/// Same shape as `measure`, but every lane is a spliced WSS pipe.
+async fn measure_spliced(proxy: &str, token: &str, scenario: &Scenario) -> Result<(), BoxError> {
+    let lane_count = scenario.concurrency.max(1);
+    let per_lane = scenario.requests.div_ceil(lane_count);
+    let payload = vec![0x5au8; scenario.size.max(1)];
+
+    let mut lanes = Vec::with_capacity(lane_count);
+    for _ in 0..lane_count {
+        lanes.push(spliced_connect(proxy, token).await?);
+    }
+    for lane in lanes.iter_mut() {
+        pipe_round_trip(lane, b"warm").await?;
+    }
+
+    let started = Instant::now();
+    let mut tasks = Vec::with_capacity(lane_count);
+    for mut lane in lanes {
+        let payload = payload.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut latencies = Vec::with_capacity(per_lane);
+            for _ in 0..per_lane {
+                let at = Instant::now();
+                let echoed = pipe_round_trip(&mut lane, &payload).await?;
+                if echoed != payload.len() {
+                    return Err(fail(format!("short echo {echoed}")));
+                }
+                latencies.push(at.elapsed());
+            }
+            Ok::<_, BoxError>(latencies)
+        }));
+    }
+    let mut latencies = Vec::new();
+    for task in tasks {
+        latencies.extend(task.await??);
+    }
+    let elapsed = started.elapsed();
+    latencies.sort();
+    let pick = |p: f64| -> f64 {
+        let index = ((latencies.len() as f64 - 1.0) * p).round() as usize;
+        latencies[index].as_secs_f64() * 1000.0
+    };
+    let total = per_lane * lane_count;
+    let mb_per_s = (scenario.size * total) as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+    println!(
+        "{}",
+        serde_json::json!({
+            "mode": "spliced",
+            "scenario": scenario.scenario,
+            "requests": total,
+            "size": scenario.size,
+            "concurrency": lane_count,
+            "elapsed_ms": (elapsed.as_secs_f64() * 1000.0).round(),
+            "rps": (total as f64 / elapsed.as_secs_f64()).round(),
+            "p50_ms": (pick(0.50) * 1000.0).round() / 1000.0,
+            "p99_ms": (pick(0.99) * 1000.0).round() / 1000.0,
+            "mb_per_s": (mb_per_s * 100.0).round() / 100.0,
+        })
+    );
+    Ok(())
 }
 
 // -------------------------------------------------------------------- driver
@@ -458,6 +613,10 @@ async fn main() -> Result<(), BoxError> {
     };
     if scenario.scenario == "connect" {
         return measure_connect(&mode, &proxy, key, token.as_deref(), scenario.requests).await;
+    }
+    if scenario.scenario == "spliced" {
+        let token = token.ok_or_else(|| fail("the spliced pipe is a new-era contract"))?;
+        return measure_spliced(&proxy, &token, &scenario).await;
     }
     let mut senders = Vec::with_capacity(scenario.concurrency);
     for _ in 0..scenario.concurrency.max(1) {
