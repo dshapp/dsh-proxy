@@ -10,8 +10,6 @@ use dashmap::DashMap;
 use tokio::net::TcpListener;
 
 use dsh_proxy::edge::Edge;
-use dsh_proxy::phone::Pool;
-use dsh_proxy::state::Registry;
 use dsh_proxy::{noise, tls, Limits, Table};
 
 #[tokio::main]
@@ -20,9 +18,7 @@ async fn main() -> Result<()> {
     let mut key: Option<String> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
-    let mut state: Option<String> = None;
     let mut self_signed = false;
-    let mut tunnels_per_device: usize = 8;
     let mut limits = Limits::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -32,10 +28,6 @@ async fn main() -> Result<()> {
             "--tls-cert" => tls_cert = args.next(),
             "--tls-key" => tls_key = args.next(),
             "--tls-self-signed" => self_signed = true,
-            "--state" => state = args.next(),
-            "--max-tunnels-per-device" => {
-                tunnels_per_device = positive(&mut args, "--max-tunnels-per-device")
-            }
             "--max-bridges" => limits.max_bridges = positive(&mut args, "--max-bridges"),
             "--max-clients-per-ip" => {
                 limits.max_clients_per_ip = positive(&mut args, "--max-clients-per-ip")
@@ -54,7 +46,6 @@ async fn main() -> Result<()> {
                 eprintln!(
                     "dsh-proxy [--listen HOST:PORT] [--key BASE64_X25519_PRIVATE]\n\
                      \t[--tls-cert PEM] [--tls-key PEM] [--tls-self-signed]\n\
-                     \t[--state FILE] [--max-tunnels-per-device N]\n\
                      \t[--max-bridges N] [--max-bridges-per-ip N]\n\
                      \t[--max-streams-per-bridge N] [--handshake-timeout-ms N]\n\
                      \t[--max-clients-per-ip N]"
@@ -89,10 +80,10 @@ async fn main() -> Result<()> {
     };
     let tls = tls::server_config(identity)?;
 
+    // No registry, no pool, no disk: pairing happens inside the tunnel,
+    // between the phone and the Mac, so the public component stores nothing.
     let table: Table = Arc::new(DashMap::new());
-    let registry = Arc::new(Registry::open(state)?);
-    let pool = Arc::new(Pool::new(table.clone(), tunnels_per_device));
-    let edge = Arc::new(Edge { pool, registry, tls, table });
+    let edge = Arc::new(Edge { tls, table });
 
     let listener = TcpListener::bind(&listen).await?;
     eprintln!("dsh-proxy listening on {listen}");

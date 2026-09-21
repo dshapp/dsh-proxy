@@ -8,8 +8,6 @@
 pub mod edge;
 pub mod mux;
 pub mod noise;
-pub mod phone;
-pub mod state;
 pub mod tls;
 pub mod tunnel;
 pub mod wire;
