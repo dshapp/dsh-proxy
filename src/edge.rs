@@ -56,7 +56,7 @@ fn fail(status: StatusCode, message: &str) -> Response<Body> {
 
 impl Edge {
     /// Terminate TLS on one accepted socket and serve HTTP/1.1 on it.
-    pub async fn serve(self: Arc<Self>, socket: TcpStream) {
+    pub async fn serve(self: Arc<Self>, socket: TcpStream, slot: Arc<crate::IpSlot>) {
         let _ = socket.set_nodelay(true);
         let acceptor = TlsAcceptor::from(self.tls.clone());
         let tls = match acceptor.accept(socket).await {
@@ -67,7 +67,8 @@ impl Edge {
         };
         let service = service_fn(move |request| {
             let edge = self.clone();
-            async move { edge.handle(request).await }
+            let slot = slot.clone();
+            async move { edge.handle(request, slot).await }
         });
         let _ = hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(tls), service)
@@ -76,10 +77,14 @@ impl Edge {
     }
 
     /// Route one request. There are exactly two.
-    async fn handle(&self, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        slot: Arc<crate::IpSlot>,
+    ) -> Result<Response<Body>, Infallible> {
         let path = req.uri().path().to_string();
         if path == "/tunnel" && is_upgrade(&req) {
-            return Ok(self.tunnel(req));
+            return Ok(self.tunnel(req, slot));
         }
         if path == "/health" {
             return Ok(json(StatusCode::OK, serde_json::json!({ "ok": true })));
@@ -93,7 +98,7 @@ impl Edge {
     /// between the phone and the Mac, and the Mac's device allowlist is the
     /// authority. What the proxy owes this route is admission control, not
     /// authentication - see the per-IP and per-bridge ceilings.
-    fn tunnel(&self, mut req: Request<Incoming>) -> Response<Body> {
+    fn tunnel(&self, mut req: Request<Incoming>, slot: Arc<crate::IpSlot>) -> Response<Body> {
         let Some(key) = req
             .headers()
             .get("sec-websocket-key")
@@ -106,6 +111,9 @@ impl Edge {
         let upgraded = hyper::upgrade::on(&mut req);
         let table = self.table.clone();
         tokio::spawn(async move {
+            // Held for the tunnel's whole life, which is what the per-IP
+            // ceiling is meant to be counting.
+            let _slot = slot;
             let Ok(upgraded) = upgraded.await else { return };
             let mut stream = WsStream::new(TokioIo::new(upgraded));
             // The preamble names the bridge; it is read from the stream just

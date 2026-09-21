@@ -23,7 +23,20 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// A frame larger than this is not a client of ours; it is a memory attack.
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+///
+/// The largest thing a phone legitimately sends is one Noise transport
+/// message, 2 + 65535 bytes. This leaves room for a client that coalesces a
+/// few of them and still bounds what one unauthenticated connection can make
+/// the proxy hold while it dribbles a body.
+const MAX_FRAME: usize = 1024 * 1024;
+/// RFC 6455 5.5: a control frame carries at most 125 bytes and is never
+/// fragmented. Enforcing it stops a large ping from being echoed back as a
+/// large pong, which is free amplification and free memory.
+const MAX_CONTROL: usize = 125;
+/// Stop queueing pongs once this much is already waiting for the socket. A
+/// peer that pings faster than it reads is answered until it stops being
+/// worth answering, and never past a bounded buffer.
+const MAX_PONG_BACKLOG: usize = 8 * 1024;
 /// Outgoing payload per frame. Bigger frames save header bytes and cost
 /// latency; the mux already hands us work in chunks well under this.
 const MAX_SEND: usize = 64 * 1024;
@@ -102,8 +115,15 @@ impl<S> WsStream<S> {
         }
         let first = self.incoming[0];
         let second = self.incoming[1];
+        let fin = first & 0x80 != 0;
         let opcode = first & 0x0f;
         let masked = second & 0x80 != 0;
+        let control = opcode & 0x08 != 0;
+        // Checked before the length is even read: a control frame that claims
+        // a 16-bit or 64-bit length is already lying.
+        if control && (!fin || (second & 0x7f) as usize > MAX_CONTROL) {
+            return Err(bad("oversized or fragmented control frame"));
+        }
         let short = (second & 0x7f) as usize;
         let (length, mut offset) = match short {
             126 => {
@@ -153,7 +173,11 @@ impl<S> WsStream<S> {
             // more stream and FIN means nothing.
             OP_CONTINUATION | OP_TEXT | OP_BINARY => self.plain.unsplit(payload),
             OP_CLOSE => self.closed = true,
-            OP_PING => self.frame(OP_PONG, &payload),
+            OP_PING => {
+                if self.outgoing.len() <= MAX_PONG_BACKLOG {
+                    self.frame(OP_PONG, &payload);
+                }
+            }
             OP_PONG => {}
             _ => return Err(bad("unknown websocket opcode")),
         }

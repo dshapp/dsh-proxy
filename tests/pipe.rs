@@ -178,6 +178,66 @@ async fn a_websocket_carries_an_end_to_end_noise_session() {
     assert!(text.ends_with("hello"), "body not echoed: {text}");
 }
 
+
+/// The per-IP ceiling has to bound live tunnels, not just handshakes.
+///
+/// A connection that upgrades hands its socket to a tunnel task and returns
+/// from `serve` at once. When the slot was scoped to that call it was released
+/// there, and a peer could hold any number of tunnels: measured against a
+/// ceiling of two, six connections all upgraded.
+#[tokio::test]
+async fn the_per_ip_ceiling_bounds_live_tunnels() {
+    let limits = dsh_proxy::Limits { max_clients_per_ip: 2, ..Default::default() };
+    let (addr, cert) = common::start_proxy_with(limits).await;
+    let _ = attach(addr).await;
+
+    let mut held = Vec::new();
+    for _ in 0..6 {
+        if let Ok(pipe) = open_pipe(addr, &cert, 4096).await {
+            held.push(pipe);
+        }
+    }
+    assert_eq!(held.len(), 2, "the ceiling must count tunnels, not handshakes");
+
+    // And it has to be a ceiling rather than a cap for life: closing one
+    // tunnel must let the next client in.
+    held.pop();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        open_pipe(addr, &cert, 4096).await.is_ok(),
+        "a released slot must be reusable"
+    );
+}
+
+/// RFC 6455 caps a control frame at 125 bytes and forbids fragmenting one.
+///
+/// Without the check a 200 KiB ping came back as a 200 KiB pong: free
+/// amplification, and an unbounded write buffer for anyone who pings faster
+/// than they read.
+#[tokio::test]
+async fn an_oversized_ping_is_refused_rather_than_echoed() {
+    let (addr, cert) = start_proxy().await;
+    let _ = attach(addr).await;
+    let mut pipe = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+
+    pipe.ping(&vec![0x41u8; 200 * 1024]).await.unwrap();
+    let answered = tokio::time::timeout(Duration::from_secs(3), pipe.recv_control()).await;
+    match answered {
+        Err(_) => {}
+        Ok(result) => assert!(result.is_err(), "an oversized ping must not be answered"),
+    }
+
+    // A well-formed ping is still answered, so this is a rule and not a mute.
+    let mut polite = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+    polite.ping(b"alive").await.unwrap();
+    let (opcode, payload) = tokio::time::timeout(Duration::from_secs(5), polite.recv_control())
+        .await
+        .expect("no pong")
+        .unwrap();
+    assert_eq!(opcode, 0xa);
+    assert_eq!(payload, b"alive");
+}
+
 /// A mini-program sends small frames; the pipe must reassemble a stream from
 /// them without caring where the boundaries fell.
 #[tokio::test]

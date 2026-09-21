@@ -86,15 +86,15 @@ type BridgesPerIp = Arc<DashMap<IpAddr, usize>>;
 /// drift-free accounting, different ceiling.
 type ClientsPerIp = Arc<DashMap<IpAddr, usize>>;
 
-/// Holds one per-IP bridge slot until dropped.
-struct IpSlot {
+/// Holds one per-IP slot until dropped.
+pub struct IpSlot {
     table: BridgesPerIp,
     ip: IpAddr,
 }
 
 impl IpSlot {
     /// Claim a slot for `ip`, or `None` when the peer already holds its share.
-    fn claim(table: &BridgesPerIp, ip: IpAddr, max: usize) -> Option<Self> {
+    pub fn claim(table: &BridgesPerIp, ip: IpAddr, max: usize) -> Option<Self> {
         let mut entry = table.entry(ip).or_insert(0);
         if *entry >= max {
             return None;
@@ -154,12 +154,16 @@ pub async fn run_edge(
             if tls {
                 // Claimed before the handshake, so a peer opening sockets it
                 // never authenticates on still hits the ceiling.
-                let Some(_slot) =
+                // Shared rather than scoped to this call: a connection that
+                // upgrades hands its socket to a tunnel task and returns from
+                // `serve` at once, so a slot released here would bound
+                // handshakes and not the tunnels that actually cost anything.
+                let Some(slot) =
                     IpSlot::claim(&clients_per_ip, peer.ip(), limits.max_clients_per_ip)
                 else {
                     return;
                 };
-                edge.serve(socket).await;
+                edge.serve(socket, Arc::new(slot)).await;
             } else {
                 let _ = serve(socket, peer.ip(), table, per_ip, budget, private, limits).await;
             }
