@@ -13,6 +13,7 @@ pub mod state;
 pub mod tls;
 pub mod tunnel;
 pub mod wire;
+pub mod ws;
 
 use std::io::Result;
 use std::net::IpAddr;
@@ -21,7 +22,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -271,7 +272,16 @@ async fn serve_bridge(
 
 /// Splice one mobile connection onto its bridge. From here the proxy only
 /// moves bytes: the Noise_IK handshake inside belongs to the two endpoints.
-async fn serve_client(socket: TcpStream, head: &[u8; HEAD_LEN], table: Table) -> Result<()> {
+/// Splice one client byte stream onto the bridge it addresses.
+///
+/// Generic over the carrier because the bytes are all that matter: today they
+/// arrive inside a WebSocket over TLS, and this code neither knows nor cares.
+/// It never looks at them either - they are the client's Noise_IK session with
+/// the Mac, and the proxy has no key for it.
+pub async fn serve_client<S>(socket: S, head: &[u8; HEAD_LEN], table: Table) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let mut key = [0u8; 32];
     key.copy_from_slice(&head[5..HEAD_LEN]);
     let Some(session) = table.get(&key).map(|entry| entry.clone()) else { return Ok(()) };
@@ -281,7 +291,7 @@ async fn serve_client(socket: TcpStream, head: &[u8; HEAD_LEN], table: Table) ->
     let tx = Arc::new(tx);
     tx.send(Bytes::copy_from_slice(head)).await?;
 
-    let (mut reader, mut writer) = socket.into_split();
+    let (mut reader, mut writer) = tokio::io::split(socket);
     let uplink = tokio::spawn({
         let tx = tx.clone();
         async move {

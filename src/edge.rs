@@ -21,13 +21,14 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
-use tokio::io::copy_bidirectional;
+use tokio::io::{copy_bidirectional, AsyncReadExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::mux::MuxSession;
 use crate::phone::{Body, Lease, Pool, MAX_BODY};
 use crate::state::{DeviceHandle, Registry};
+use crate::wire::{HEAD_LEN, MAGIC_CLIENT, VERSION};
 
 /// Everything the edge needs to serve one connection.
 pub struct Edge {
@@ -157,11 +158,20 @@ impl Edge {
             return Ok(json(StatusCode::OK, serde_json::json!({ "ok": true })));
         }
 
+        // The one client contract: a WebSocket carrying the phone's own byte
+        // stream. No token is checked here, and none could be: the session
+        // inside is Noise_IK between the phone and the Mac, and the Mac's
+        // device allowlist is the authority. What the proxy owes this route
+        // is admission control, not authentication - see the per-IP and
+        // per-bridge ceilings.
+        if path == "/tunnel" && is_upgrade(&req) {
+            return Ok(self.tunnel(req));
+        }
+
         let route = match self.authenticate(&req) {
             Some(route) => route,
             None => return Ok(fail(StatusCode::UNAUTHORIZED, "missing or unknown bearer token")),
         };
-
         if !path.starts_with("/api/") {
             return Ok(fail(StatusCode::NOT_FOUND, "no such route"));
         }
@@ -311,6 +321,52 @@ impl Edge {
             lease: Some(lease),
         };
         response.body(streamed.boxed()).expect("a built response")
+    }
+
+    /// Answer a WebSocket upgrade and splice the stream inside it.
+    ///
+    /// The proxy terminates the WebSocket itself rather than forwarding the
+    /// upgrade, because what rides inside is not HTTP: it is the 37-byte
+    /// preamble and then a Noise_IK session, exactly what a phone used to put
+    /// on a bare TCP socket. Unwrapping the frames is all that changed.
+    fn tunnel(&self, mut req: Request<Incoming>) -> Response<Body> {
+        let Some(key) = req
+            .headers()
+            .get("sec-websocket-key")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
+        else {
+            return fail(StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key");
+        };
+        let accept = crate::ws::accept_key(&key);
+        let upgraded = hyper::upgrade::on(&mut req);
+        let table = self.table.clone();
+        tokio::spawn(async move {
+            let Ok(upgraded) = upgraded.await else { return };
+            let mut stream = crate::ws::WsStream::new(TokioIo::new(upgraded));
+            // The preamble names the bridge; it is read from the stream just
+            // as the bare-TCP path read it from the socket.
+            let mut head = [0u8; HEAD_LEN];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                stream.read_exact(&mut head),
+            )
+            .await;
+            if !matches!(read, Ok(Ok(_))) {
+                return;
+            }
+            if head[..4] != MAGIC_CLIENT || head[4] != VERSION {
+                return;
+            }
+            let _ = crate::serve_client(stream, &head, table).await;
+        });
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .header("sec-websocket-accept", accept)
+            .body(boxed_full(Bytes::new()))
+            .expect("a built response")
     }
 
     /// Splice a WebSocket upgrade onto a dedicated tunnel.
