@@ -9,7 +9,6 @@ pub mod edge;
 pub mod mux;
 pub mod noise;
 pub mod tls;
-pub mod tunnel;
 pub mod wire;
 pub mod ws;
 
@@ -28,7 +27,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use mux::MuxSession;
 use wire::{
-    HEAD_LEN, MAGIC_BRIDGE, MAGIC_CLIENT, MAX_PAYLOAD, MAX_STREAMS_PER_BRIDGE, VERSION, WINDOW,
+    HEAD_LEN, MAGIC_BRIDGE, MAX_PAYLOAD, MAX_STREAMS_PER_BRIDGE, VERSION, WINDOW,
 };
 
 /// A connection that does not deliver its preamble is not a client of ours.
@@ -119,26 +118,6 @@ impl Drop for IpSlot {
 
 pub type Table = Arc<DashMap<[u8; 32], Arc<MuxSession>>>;
 
-/// Serve until the listener fails.
-pub async fn run(listener: TcpListener, private: Arc<Vec<u8>>, limits: Limits) -> Result<()> {
-    let table: Table = Arc::new(DashMap::new());
-    let per_ip: BridgesPerIp = Arc::new(DashMap::new());
-    // A permit pool rather than a length check, so the ceiling is exact even
-    // when many bridges arrive at once.
-    let budget = Arc::new(Semaphore::new(limits.max_bridges));
-    loop {
-        let (socket, peer) = listener.accept().await?;
-        let table = table.clone();
-        let per_ip = per_ip.clone();
-        let budget = budget.clone();
-        let private = private.clone();
-        tokio::spawn(async move {
-            let _ = socket.set_nodelay(true);
-            let _ = serve(socket, peer.ip(), table, per_ip, budget, private, limits).await;
-        });
-    }
-}
-
 /// Serve the unified client edge alongside bridge links on one port.
 ///
 /// A TLS ClientHello starts with 0x16 and a preamble starts with 'D', so one
@@ -204,8 +183,10 @@ async fn serve(
     }
     let magic: [u8; 4] = [head[0], head[1], head[2], head[3]];
     match magic {
+        // A bridge is the Mac dialling out, not an end user, so it keeps its
+        // own compact preamble. Clients no longer arrive this way at all:
+        // they come over TLS and a WebSocket, and nothing else is accepted.
         MAGIC_BRIDGE => serve_bridge(socket, &head, peer, table, per_ip, budget, &private, limits).await,
-        MAGIC_CLIENT => serve_client(socket, &head, table).await,
         // Anything else gets nothing back: an unknown speaker learns nothing.
         _ => Ok(()),
     }

@@ -1,10 +1,10 @@
-//! One mux stream that carries plaintext HTTP/1.1 inside Noise_IK.
+//! The phone's half of the tunnel, written for the tests.
 //!
-//! The proxy runs the IK handshake itself (see `noise::ik_initiate`) and then
-//! wraps the stream in this: every write is sealed into one `[u16 len][sealed]`
-//! transport message, every read opens one. It mirrors what a phone's
-//! `NoiseInputStream`/`NoiseOutputStream` do, on the other end of the same
-//! tunnel, so the bridge sees an ordinary encrypted phone connection.
+//! The proxy does not contain this: it never runs a Noise_IK handshake and
+//! never opens an application frame. Keeping the peer here, as an independent
+//! implementation, is what makes these tests evidence rather than a mirror.
+
+#![allow(dead_code)]
 
 use std::io::{Error, ErrorKind, Result};
 use std::pin::Pin;
@@ -15,7 +15,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use crate::wire::{MAX_NOISE_MSG, TAG_LEN};
+use dsh_proxy::wire::{MAX_HANDSHAKE_MSG, MAX_NOISE_MSG, NOISE_IK, TAG_LEN};
 
 /// Largest plaintext that fits one transport message.
 const MAX_PLAIN: usize = MAX_NOISE_MSG - TAG_LEN;
@@ -202,4 +202,82 @@ pub async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, body: &[u8]) -> 
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(body);
     stream.write_all(&out).await
+}
+
+fn invalid(error: impl std::fmt::Display) -> Error {
+    Error::new(ErrorKind::InvalidData, error.to_string())
+}
+
+pub async fn ik_initiate<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
+    device_private: &[u8],
+    bridge_public: &[u8],
+    prologue: &[u8],
+    first_payload: &[u8],
+) -> Result<StatelessTransportState> {
+    let params = NOISE_IK.parse().map_err(invalid)?;
+    let mut handshake = snow::Builder::new(params)
+        .local_private_key(device_private)
+        .remote_public_key(bridge_public)
+        .prologue(prologue)
+        .build_initiator()
+        .map_err(invalid)?;
+
+    let mut buf = vec![0u8; MAX_HANDSHAKE_MSG];
+    let n = handshake.write_message(first_payload, &mut buf).map_err(invalid)?;
+    write_frame(socket, &buf[..n]).await?;
+    let msg2 = read_frame(socket).await?;
+    handshake.read_message(&msg2, &mut buf).map_err(invalid)?;
+
+    // IK already proves the responder to us, but assert the identity anyway:
+    // a bridge that answered with the wrong static key is not our bridge.
+    match handshake.get_remote_static() {
+        Some(remote) if remote == bridge_public => {}
+        Some(_) => return Err(invalid("bridge proved an unexpected static key")),
+        None => return Err(invalid("bridge sent no static key")),
+    }
+    handshake.into_stateless_transport_mode().map_err(invalid)
+}
+
+/// Respond to a device's Noise_IK handshake — the bridge's side of the same
+/// protocol the proxy initiates above.
+///
+/// This is what a real bridge runs; it lives here so the loopback harness is an
+/// independent implementation of the peer rather than a second copy of the
+/// proxy's own code.
+///
+/// @returns the device's static public key, the first message's payload (the
+/// pairing token on first contact) and the finished transport.
+pub async fn ik_respond<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
+    bridge_private: &[u8],
+    prologue: &[u8],
+) -> Result<([u8; 32], Vec<u8>, StatelessTransportState)> {
+    let params = NOISE_IK.parse().map_err(invalid)?;
+    let mut handshake = snow::Builder::new(params)
+        .local_private_key(bridge_private)
+        .prologue(prologue)
+        .build_responder()
+        .map_err(invalid)?;
+
+    // IK's first message carries the initiator's static key and its payload;
+    // the second is the responder's only flight.
+    let mut buf = vec![0u8; MAX_HANDSHAKE_MSG];
+    let msg1 = read_frame(socket).await?;
+    let mut payload = vec![0u8; MAX_HANDSHAKE_MSG];
+    let n = handshake
+        .read_message(&msg1, &mut payload)
+        .map_err(invalid)?;
+    payload.truncate(n);
+
+    let remote = handshake
+        .get_remote_static()
+        .ok_or_else(|| invalid("device sent no static key"))?;
+    let key: [u8; 32] = remote.try_into().map_err(|_| invalid("bad static key length"))?;
+
+    let n = handshake.write_message(&[], &mut buf).map_err(invalid)?;
+    write_frame(socket, &buf[..n]).await?;
+
+    let transport = handshake.into_stateless_transport_mode().map_err(invalid)?;
+    Ok((key, payload, transport))
 }

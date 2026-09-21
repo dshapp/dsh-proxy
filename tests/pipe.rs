@@ -5,7 +5,6 @@
 //! with the bridge. Nothing inside is readable by the proxy, which is the
 //! point - it is the same end-to-end session a bare TCP socket used to carry.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,135 +13,21 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use dsh_proxy::edge::Edge;
 use dsh_proxy::mux::{MuxSession, MuxStreamIo};
 use dsh_proxy::noise;
-use dsh_proxy::tls;
-use dsh_proxy::tunnel::NoiseStream;
-use dsh_proxy::wire::{HEAD_LEN, MAGIC_BRIDGE, MAGIC_CLIENT, VERSION};
+use common::phone::{ik_respond, NoiseStream};
+use dsh_proxy::wire::{HEAD_LEN, MAGIC_BRIDGE, MAGIC_CLIENT};
 
-fn preamble(magic: &[u8; 4], key: &[u8; 32]) -> Vec<u8> {
-    let mut head = Vec::with_capacity(HEAD_LEN);
-    head.extend_from_slice(magic);
-    head.push(VERSION);
-    head.extend_from_slice(key);
-    head
-}
+mod common;
+use common::{open_pipe, preamble, start_proxy, Pipe};
 
-// ------------------------------------------------------- a minimal WS client
-
-/// Frame `payload` the way a browser or `wx.connectSocket` would: masked.
-fn client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 14);
-    out.push(0x80 | opcode);
-    let mask_bit = 0x80u8;
-    if payload.len() < 126 {
-        out.push(mask_bit | payload.len() as u8);
-    } else if payload.len() <= u16::MAX as usize {
-        out.push(mask_bit | 126);
-        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    } else {
-        out.push(mask_bit | 127);
-        out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    }
-    let mask = [0x37u8, 0xfa, 0x21, 0x3d];
-    out.extend_from_slice(&mask);
-    for (index, byte) in payload.iter().enumerate() {
-        out.push(byte ^ mask[index % 4]);
-    }
-    out
-}
-
-/// A client-side WebSocket that presents itself as a byte stream.
-struct WsClient<S> {
-    inner: S,
-    plain: Vec<u8>,
-    /// Payload bytes per outgoing frame, so fragmentation can be exercised.
-    chunk: usize,
-}
-
-impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
-    async fn send(&mut self, data: &[u8]) -> std::io::Result<()> {
-        for piece in data.chunks(self.chunk) {
-            self.inner.write_all(&client_frame(0x2, piece)).await?;
-        }
-        self.inner.flush().await
-    }
-
-    async fn ping(&mut self, payload: &[u8]) -> std::io::Result<()> {
-        self.inner.write_all(&client_frame(0x9, payload)).await?;
-        self.inner.flush().await
-    }
-
-    /// Read until `want` payload bytes have arrived, unframing as we go.
-    async fn recv(&mut self, want: usize) -> std::io::Result<Vec<u8>> {
-        while self.plain.len() < want {
-            let mut head = [0u8; 2];
-            self.inner.read_exact(&mut head).await?;
-            let opcode = head[0] & 0x0f;
-            assert_eq!(head[1] & 0x80, 0, "a server frame must not be masked");
-            let length = match head[1] & 0x7f {
-                126 => {
-                    let mut bytes = [0u8; 2];
-                    self.inner.read_exact(&mut bytes).await?;
-                    u16::from_be_bytes(bytes) as usize
-                }
-                127 => {
-                    let mut bytes = [0u8; 8];
-                    self.inner.read_exact(&mut bytes).await?;
-                    u64::from_be_bytes(bytes) as usize
-                }
-                other => other as usize,
-            };
-            let mut payload = vec![0u8; length];
-            self.inner.read_exact(&mut payload).await?;
-            match opcode {
-                0x0 | 0x1 | 0x2 => self.plain.extend_from_slice(&payload),
-                0xa => {}
-                0x8 => return Err(std::io::Error::other("server closed")),
-                other => panic!("unexpected opcode {other}"),
-            }
-        }
-        Ok(self.plain.drain(..want).collect())
-    }
-
-    /// Read one control frame, returning its opcode and payload.
-    async fn recv_control(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
-        let mut head = [0u8; 2];
-        self.inner.read_exact(&mut head).await?;
-        let length = (head[1] & 0x7f) as usize;
-        let mut payload = vec![0u8; length];
-        self.inner.read_exact(&mut payload).await?;
-        Ok((head[0] & 0x0f, payload))
-    }
-}
 
 // ------------------------------------------------------------- the two ends
 
-async fn start_proxy() -> (std::net::SocketAddr, rustls::pki_types::CertificateDer<'static>) {
-    let identity = tls::self_signed(&["localhost"]).unwrap();
-    let cert = identity.cert_chain[0].clone();
-    let server = tls::server_config(identity).unwrap();
-    let table = Arc::new(dashmap::DashMap::new());
-    let edge = Arc::new(Edge { tls: server, table });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let private = noise::generate_keypair().unwrap().0;
-    tokio::spawn(async move {
-        let _ = dsh_proxy::run_edge(
-            listener,
-            Arc::new(private),
-            dsh_proxy::Limits::default(),
-            edge,
-        )
-        .await;
-    });
-    (addr, cert)
-}
 
 async fn write_lp(socket: &mut TcpStream, body: &[u8]) {
     let mut out = Vec::with_capacity(body.len() + 2);
@@ -164,7 +49,7 @@ async fn attach(addr: std::net::SocketAddr) -> [u8; 32] {
     let (private, public) = noise::generate_keypair().unwrap();
     let mut socket = TcpStream::connect(addr).await.unwrap();
     socket.set_nodelay(true).unwrap();
-    let head = preamble(&MAGIC_BRIDGE, &[0u8; 32]);
+    let head = preamble(&MAGIC_BRIDGE, 1, &[0u8; 32]);
     socket.write_all(&head).await.unwrap();
     let mut handshake = snow::Builder::new(dsh_proxy::wire::NOISE_XX.parse().unwrap())
         .local_private_key(&private)
@@ -197,7 +82,7 @@ async fn attach(addr: std::net::SocketAddr) -> [u8; 32] {
                 return;
             }
             let Ok((_device, _token, transport)) =
-                noise::ik_respond(&mut io, &private, &head).await
+                ik_respond(&mut io, &private, &head).await
             else {
                 return;
             };
@@ -218,40 +103,10 @@ async fn attach(addr: std::net::SocketAddr) -> [u8; 32] {
     public.try_into().unwrap()
 }
 
-/// Open the pipe: TLS, then the upgrade, leaving a byte stream behind.
-async fn open_pipe(
-    addr: std::net::SocketAddr,
-    cert: &rustls::pki_types::CertificateDer<'static>,
-    chunk: usize,
-) -> WsClient<tokio_rustls::client::TlsStream<TcpStream>> {
-    let connector = tokio_rustls::TlsConnector::from(tls::client_config_trusting(cert.clone()));
-    let socket = TcpStream::connect(addr).await.unwrap();
-    socket.set_nodelay(true).unwrap();
-    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let mut tls = connector.connect(name, socket).await.unwrap();
-    let request = "GET /tunnel HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
-                   Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
-                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
-    tls.write_all(request.as_bytes()).await.unwrap();
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        tls.read_exact(&mut byte).await.unwrap();
-        head.push(byte[0]);
-    }
-    let text = String::from_utf8_lossy(&head);
-    assert!(text.starts_with("HTTP/1.1 101"), "no 101: {text}");
-    // RFC 6455's accept value for the fixed key above.
-    assert!(
-        text.to_ascii_lowercase().contains("s3pplmbitxaq9kygzzhzrbk+xoo="),
-        "wrong Sec-WebSocket-Accept: {text}"
-    );
-    WsClient { inner: tls, plain: Vec::new(), chunk }
-}
 
 /// Drive one HTTP request through Noise, inside the pipe.
 async fn call(
-    pipe: &mut WsClient<tokio_rustls::client::TlsStream<TcpStream>>,
+    pipe: &mut Pipe,
     transport: &snow::StatelessTransportState,
     nonce: &mut u64,
     in_nonce: &mut u64,
@@ -290,9 +145,9 @@ async fn call(
 async fn a_websocket_carries_an_end_to_end_noise_session() {
     let (addr, cert) = start_proxy().await;
     let bridge_key = attach(addr).await;
-    let mut pipe = open_pipe(addr, &cert, 64 * 1024).await;
+    let mut pipe = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
 
-    let head = preamble(&MAGIC_CLIENT, &bridge_key);
+    let head = preamble(&MAGIC_CLIENT, 1, &bridge_key);
     pipe.send(&head).await.unwrap();
 
     let (device_private, _) = noise::generate_keypair().unwrap();
@@ -330,9 +185,9 @@ async fn a_preamble_split_across_frames_still_routes() {
     let (addr, cert) = start_proxy().await;
     let bridge_key = attach(addr).await;
     // Seven bytes per frame: the 37-byte preamble spans six of them.
-    let mut pipe = open_pipe(addr, &cert, 7).await;
+    let mut pipe = open_pipe(addr, &cert, 7).await.unwrap();
 
-    let head = preamble(&MAGIC_CLIENT, &bridge_key);
+    let head = preamble(&MAGIC_CLIENT, 1, &bridge_key);
     pipe.send(&head).await.unwrap();
 
     let (device_private, _) = noise::generate_keypair().unwrap();
@@ -366,7 +221,7 @@ async fn a_preamble_split_across_frames_still_routes() {
 async fn a_ping_is_answered_with_a_pong() {
     let (addr, cert) = start_proxy().await;
     let _ = attach(addr).await;
-    let mut pipe = open_pipe(addr, &cert, 4096).await;
+    let mut pipe = open_pipe(addr, &cert, 4096).await.unwrap();
     pipe.ping(b"alive").await.unwrap();
     let (opcode, payload) = tokio::time::timeout(Duration::from_secs(5), pipe.recv_control())
         .await
@@ -381,8 +236,8 @@ async fn a_ping_is_answered_with_a_pong() {
 async fn an_unknown_bridge_key_is_dropped() {
     let (addr, cert) = start_proxy().await;
     let _ = attach(addr).await;
-    let mut pipe = open_pipe(addr, &cert, 4096).await;
-    pipe.send(&preamble(&MAGIC_CLIENT, &[9u8; 32])).await.unwrap();
+    let mut pipe = open_pipe(addr, &cert, 4096).await.unwrap();
+    pipe.send(&preamble(&MAGIC_CLIENT, 1, &[9u8; 32])).await.unwrap();
     pipe.send(b"anything").await.unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(3), pipe.recv(1)).await;
     match outcome {

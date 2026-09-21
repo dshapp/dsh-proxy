@@ -7,11 +7,14 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+mod common;
+use common::{open_pipe, preamble, start_proxy, start_proxy_with};
 
 const PARAMS: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_PAYLOAD: usize = 16384;
@@ -20,29 +23,6 @@ const KIND_OPEN: u8 = 0;
 const KIND_DATA: u8 = 1;
 const KIND_CLOSE: u8 = 2;
 const KIND_WINDOW: u8 = 3;
-
-fn preamble(magic: &[u8; 4], version: u8, key: &[u8]) -> Vec<u8> {
-    let mut head = Vec::with_capacity(37);
-    head.extend_from_slice(magic);
-    head.push(version);
-    head.extend_from_slice(key);
-    head
-}
-
-async fn start_proxy() -> SocketAddr {
-    start_proxy_with(dsh_proxy::Limits::default()).await
-}
-
-/// A proxy with explicit admission limits, for the tests that need small ones.
-async fn start_proxy_with(limits: dsh_proxy::Limits) -> SocketAddr {
-    let (private, _) = dsh_proxy::noise::generate_keypair().unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = dsh_proxy::run(listener, Arc::new(private), limits).await;
-    });
-    addr
-}
 
 /// A bridge that echoes every byte of every stream back to its phone.
 struct EchoBridge {
@@ -200,8 +180,10 @@ async fn read_lp_opt(socket: &mut TcpStream) -> Option<Vec<u8>> {
 }
 
 /// Bring up a proxy with an echo bridge attached; returns the address and key.
-async fn proxy_with_bridge() -> (SocketAddr, Vec<u8>) {
-    proxy_with_bridge_at(start_proxy().await).await
+async fn proxy_with_bridge() -> (SocketAddr, CertificateDer<'static>, Vec<u8>) {
+    let (addr, cert) = start_proxy().await;
+    let (addr, key) = proxy_with_bridge_at(addr).await;
+    (addr, cert, key)
 }
 
 /// The same, on an already-started proxy.
@@ -216,16 +198,15 @@ async fn proxy_with_bridge_at(addr: SocketAddr) -> (SocketAddr, Vec<u8>) {
 
 #[tokio::test]
 async fn phone_round_trip() {
-    let (addr, key) = proxy_with_bridge().await;
+    let (addr, cert, key) = proxy_with_bridge().await;
     let head = preamble(b"DSHC", 1, &key);
 
-    let mut phone = TcpStream::connect(addr).await.unwrap();
-    phone.write_all(&head).await.unwrap();
-    phone.write_all(b"hello bridge").await.unwrap();
+    let mut phone = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+    phone.send(&head).await.unwrap();
+    phone.send(b"hello bridge").await.unwrap();
 
     // The proxy forwards the preamble into the stream first, so it comes back.
-    let mut got = vec![0u8; head.len() + 12];
-    phone.read_exact(&mut got).await.unwrap();
+    let got = phone.recv(head.len() + 12).await.unwrap();
     assert_eq!(&got[..head.len()], &head[..]);
     assert_eq!(&got[head.len()..], b"hello bridge");
 }
@@ -234,24 +215,25 @@ async fn phone_round_trip() {
 /// which only completes if batched WINDOW updates keep the credit flowing.
 #[tokio::test]
 async fn bulk_transfer_through_window() {
-    let (addr, key) = proxy_with_bridge().await;
+    let (addr, cert, key) = proxy_with_bridge().await;
     let head = preamble(b"DSHC", 1, &key);
     let payload: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
 
-    let phone = TcpStream::connect(addr).await.unwrap();
-    let (mut reader, mut writer) = phone.into_split();
-
+    let mut phone = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+    phone.send(&head).await.unwrap();
+    // Writing and reading on one pipe: the send must not block on the echo,
+    // so it runs while this task drains. A single task would deadlock at the
+    // first window, which is exactly what this test is for.
+    let (reader, writer) = tokio::io::split(phone.inner);
+    let mut reader = common::WsClient::new(reader, 64 * 1024);
     let send = payload.clone();
-    // The task returns the write half so it is NOT dropped: a phone that
-    // half-closes ends the stream, since the mux has no half-close signal.
     let writing = tokio::spawn(async move {
-        writer.write_all(&head).await.unwrap();
-        writer.write_all(&send).await.unwrap();
+        let mut writer = common::WsClient::new(writer, 64 * 1024);
+        writer.send(&send).await.unwrap();
         writer
     });
 
-    let mut echoed = vec![0u8; 37 + payload.len()];
-    tokio::time::timeout(Duration::from_secs(60), reader.read_exact(&mut echoed))
+    let echoed = tokio::time::timeout(Duration::from_secs(60), reader.recv(37 + payload.len()))
         .await
         .expect("bulk transfer timed out")
         .unwrap();
@@ -262,17 +244,17 @@ async fn bulk_transfer_through_window() {
 /// Many streams at once on one link: ids, windows and inboxes stay separate.
 #[tokio::test]
 async fn concurrent_streams_stay_separate() {
-    let (addr, key) = proxy_with_bridge().await;
+    let (addr, cert, key) = proxy_with_bridge().await;
     let mut tasks = Vec::new();
     for i in 0..50u32 {
         let head = preamble(b"DSHC", 1, &key);
+        let cert = cert.clone();
         tasks.push(tokio::spawn(async move {
             let body = format!("stream-{i:04}-payload").repeat(64);
-            let mut phone = TcpStream::connect(addr).await.unwrap();
-            phone.write_all(&head).await.unwrap();
-            phone.write_all(body.as_bytes()).await.unwrap();
-            let mut got = vec![0u8; head.len() + body.len()];
-            phone.read_exact(&mut got).await.unwrap();
+            let mut phone = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+            phone.send(&head).await.unwrap();
+            phone.send(body.as_bytes()).await.unwrap();
+            let got = phone.recv(head.len() + body.len()).await.unwrap();
             assert_eq!(&got[head.len()..], body.as_bytes());
         }));
     }
@@ -284,7 +266,7 @@ async fn concurrent_streams_stay_separate() {
 /// The keepalive channel must be echoed, or the bridge tears the link down.
 #[tokio::test]
 async fn keepalive_is_echoed() {
-    let addr = start_proxy().await;
+    let (addr, _cert) = start_proxy().await;
     let (private, _) = dsh_proxy::noise::generate_keypair().unwrap();
     let mut bridge = EchoBridge::connect(addr, &private).await;
     bridge.send_frame(0, KIND_DATA, &[]).await;
@@ -307,20 +289,24 @@ async fn spawn_echo_bridge(
 }
 
 /// One phone: dial the key and confirm the preamble plus its body come back.
-async fn phone_echos_body(addr: SocketAddr, key: &[u8], body: &[u8]) -> bool {
-    let Some(mut phone) = TcpStream::connect(addr).await.ok() else { return false };
-    if phone.write_all(&preamble(b"DSHC", 1, key)).await.is_err() {
+async fn phone_echos_body(
+    addr: SocketAddr,
+    cert: &CertificateDer<'static>,
+    key: &[u8],
+    body: &[u8],
+) -> bool {
+    let Ok(mut phone) = open_pipe(addr, cert, 64 * 1024).await else { return false };
+    if phone.send(&preamble(b"DSHC", 1, key)).await.is_err() {
         return false;
     }
-    if phone.write_all(body).await.is_err() {
+    if phone.send(body).await.is_err() {
         return false;
     }
-    let mut got = vec![0u8; 37 + body.len()];
-    let Ok(result) = tokio::time::timeout(Duration::from_secs(5), phone.read_exact(&mut got)).await
+    let Ok(result) = tokio::time::timeout(Duration::from_secs(5), phone.recv(37 + body.len())).await
     else {
         return false;
     };
-    result.is_ok() && got[37..] == *body
+    matches!(result, Ok(got) if got[37..] == *body)
 }
 
 /// A second registration for the same key must not orphan the first link.
@@ -333,13 +319,13 @@ async fn phone_echos_body(addr: SocketAddr, key: &[u8], body: &[u8]) -> bool {
 /// it instead, so the displaced bridge reconnects and re-registers.
 #[tokio::test]
 async fn duplicate_registration_replaces_the_link() {
-    let addr = start_proxy().await;
+    let (addr, cert) = start_proxy().await;
     let (private, public) = dsh_proxy::noise::generate_keypair().unwrap();
     let body = "duplicate-registration-body".repeat(8).into_bytes();
 
     // Link A registers the key and answers a phone.
     let (a_dead, _a_handle) = spawn_echo_bridge(addr, &private).await;
-    assert!(phone_echos_body(addr, &public, &body).await, "first link never worked");
+    assert!(phone_echos_body(addr, &cert, &public, &body).await, "first link never worked");
 
     // Link B proves the same key and takes the route over.
     let (b_dead, b_handle) = spawn_echo_bridge(addr, &private).await;
@@ -352,44 +338,48 @@ async fn duplicate_registration_replaces_the_link() {
         .expect("the displaced link's task vanished");
 
     // The key now routes to the newest link, and still works.
-    assert!(phone_echos_body(addr, &public, &body).await, "the newest link is unreachable");
+    assert!(phone_echos_body(addr, &cert, &public, &body).await, "the newest link is unreachable");
 
     // When the newer link dies too, the key must route nowhere: the old link is
     // gone, so there is no phantom session left answering for it.
     b_handle.abort();
     let _ = b_dead.await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!phone_echos_body(addr, &public, &body).await, "a dead link still answered");
+    assert!(!phone_echos_body(addr, &cert, &public, &body).await, "a dead link still answered");
 }
 
 #[tokio::test]
 async fn unknown_bridge_key_is_dropped() {
-    let addr = start_proxy().await;
-    let mut phone = TcpStream::connect(addr).await.unwrap();
-    phone.write_all(&preamble(b"DSHC", 1, &[9u8; 32])).await.unwrap();
-    let _ = phone.write_all(b"anyone there?").await;
-    let mut got = Vec::new();
-    // Clean EOF or a reset both mean the proxy said nothing.
-    let _ = phone.read_to_end(&mut got).await;
-    assert!(got.is_empty(), "unknown key learned something");
+    let (addr, cert) = start_proxy().await;
+    let mut phone = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+    phone.send(&preamble(b"DSHC", 1, &[9u8; 32])).await.unwrap();
+    let _ = phone.send(b"anyone there?").await;
+    // A close frame, a clean EOF or a reset all mean the proxy said nothing.
+    let outcome = tokio::time::timeout(Duration::from_secs(3), phone.recv(1)).await;
+    match outcome {
+        Err(_) => {}
+        Ok(result) => assert!(result.is_err(), "unknown key learned something"),
+    }
 }
 
 #[tokio::test]
 async fn wrong_version_and_magic_are_dropped() {
-    let addr = start_proxy().await;
+    let (addr, cert) = start_proxy().await;
     for head in [preamble(b"DSHC", 2, &[0u8; 32]), preamble(b"XXXX", 1, &[0u8; 32])] {
-        let mut sock = TcpStream::connect(addr).await.unwrap();
-        sock.write_all(&head).await.unwrap();
-        let mut got = Vec::new();
-        sock.read_to_end(&mut got).await.unwrap();
-        assert!(got.is_empty());
+        let mut phone = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+        phone.send(&head).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), phone.recv(1)).await;
+        match outcome {
+            Err(_) => {}
+            Ok(result) => assert!(result.is_err(), "a bad preamble learned something"),
+        }
     }
 }
 /// An unauthenticated peer cannot claim more than its share of the table.
 #[tokio::test]
 async fn too_many_bridges_from_one_ip_are_refused() {
     let limits = dsh_proxy::Limits { max_bridges_per_ip: 2, ..Default::default() };
-    let addr = start_proxy_with(limits).await;
+    let (addr, _cert) = start_proxy_with(limits).await;
 
     // Two are admitted; their links stay open.
     let mut held = Vec::new();
@@ -428,7 +418,7 @@ async fn stalled_handshake_is_timed_out() {
         handshake_timeout: Duration::from_millis(300),
         ..Default::default()
     };
-    let addr = start_proxy_with(limits).await;
+    let (addr, _cert) = start_proxy_with(limits).await;
 
     // A valid preamble and a well-formed first message, then silence.
     let (private, _) = dsh_proxy::noise::generate_keypair().unwrap();
@@ -455,23 +445,23 @@ async fn stalled_handshake_is_timed_out() {
 async fn stream_budget_is_never_exceeded() {
     const CAP: usize = 8;
     let limits = dsh_proxy::Limits { max_streams_per_bridge: CAP, ..Default::default() };
-    let addr = start_proxy_with(limits).await;
+    let (addr, cert) = start_proxy_with(limits).await;
     let (addr, key) = proxy_with_bridge_at(addr).await;
 
     // Every phone holds its stream open, so no slot is freed mid-race.
     let mut phones = Vec::new();
     for _ in 0..CAP * 4 {
         let head = preamble(b"DSHC", 1, &key);
+        let cert = cert.clone();
         phones.push(tokio::spawn(async move {
-            let mut phone = TcpStream::connect(addr).await.unwrap();
-            if phone.write_all(&head).await.is_err() {
+            let mut phone = open_pipe(addr, &cert, 64 * 1024).await.ok()?;
+            if phone.send(&head).await.is_err() {
                 return None;
             }
             // An opened stream echoes the preamble back; a refused one is
             // closed or silent, so the read never completes.
-            let mut got = vec![0u8; head.len()];
-            match tokio::time::timeout(Duration::from_secs(5), phone.read_exact(&mut got)).await {
-                Ok(Ok(_)) if got == head => Some(phone),
+            match tokio::time::timeout(Duration::from_secs(5), phone.recv(head.len())).await {
+                Ok(Ok(got)) if got == head => Some(phone),
                 _ => None,
             }
         }));
@@ -549,7 +539,7 @@ async fn credit_ignoring_bridge(
 #[tokio::test]
 async fn inbox_overflow_costs_one_stream_not_the_link() {
     let limits = dsh_proxy::Limits { max_streams_per_bridge: 8, ..Default::default() };
-    let addr = start_proxy_with(limits).await;
+    let (addr, cert) = start_proxy_with(limits).await;
     let (private, key) = dsh_proxy::noise::generate_keypair().unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
@@ -565,10 +555,9 @@ async fn inbox_overflow_costs_one_stream_not_the_link() {
 
     // The phone is the only client on this link. It reads the echo, then stops
     // reading, so the flood below has nowhere to drain.
-    let mut victim = TcpStream::connect(addr).await.unwrap();
-    victim.write_all(&preamble(b"DSHC", 1, &key)).await.unwrap();
-    let mut echoed = vec![0u8; 37];
-    tokio::time::timeout(Duration::from_secs(5), victim.read_exact(&mut echoed))
+    let mut victim = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+    victim.send(&preamble(b"DSHC", 1, &key)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), victim.recv(37))
         .await
         .expect("victim stream never opened")
         .unwrap();
@@ -582,10 +571,9 @@ async fn inbox_overflow_costs_one_stream_not_the_link() {
     drop(victim);
 
     // The link itself is unharmed: a new stream still opens on it.
-    let mut second = TcpStream::connect(addr).await.unwrap();
-    second.write_all(&preamble(b"DSHC", 1, &key)).await.unwrap();
-    let mut echoed = vec![0u8; 37];
-    tokio::time::timeout(Duration::from_secs(5), second.read_exact(&mut echoed))
+    let mut second = open_pipe(addr, &cert, 64 * 1024).await.unwrap();
+    second.send(&preamble(b"DSHC", 1, &key)).await.unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(5), second.recv(37))
         .await
         .expect("the link died with one stream")
         .unwrap();

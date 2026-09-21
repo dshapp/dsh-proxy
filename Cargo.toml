@@ -11,13 +11,14 @@ bytes = "1"
 dashmap = "6"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server", "client"] }
+# server only: the proxy answers one upgrade and then copies bytes. It is
+# never an HTTP client, because it never re-originates a client request.
+hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 rcgen = "0.14"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # ring-accelerated: ring's assembly ChaChaPoly/SHA256 backend for the bridge
 # link. Measured 3x faster than the pure-Rust default at our 16 KiB frame.
