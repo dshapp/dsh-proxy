@@ -1,101 +1,59 @@
-# Old edge vs unified edge — measured
+# 老方案 vs 最终方案 — 实测
 
-Both systems run the **same bridge** half (Noise_XX registration, one
-Noise_IK tunnel per client stream, plain HTTP/1.1 inside). The only difference
-is the client edge, so the delta below is exactly the cost of the new one.
+两列跑的是**同一个 bridge、同一套 Noise_IK、同样的负载**，唯一差别是谁来搬字节：
 
-- `old` = commit `38c1eab` binary + a raw-TCP phone: TCP, 37-byte `DSHC`
-  preamble, Noise_IK end to end through the proxy.
-- `new` = this branch's binary + a TLS client: TLS 1.3, `Authorization:
-  Bearer`, proxy-terminated Noise_IK to the bridge.
+- `old` = 提交 `38c1eab` 的 proxy + 裸 TCP 手机端
+- `new` = 本分支的 proxy + 走 TLS/WebSocket 的手机端
 
-Everything is loopback on one Apple M4 Pro (14 cores, 48 GB), proxy, bridge and
-load generator on the same host, so **both columns are floors** — a real
-deployment adds at least one wide-area round trip and, on the bundled VPS, a
-~0.5 MB/s bandwidth ceiling that neither column models. The crypto and
-connection-handling deltas are what transfer; absolute numbers do not.
+两边做同一件事：客户端发 `[u32 长度][负载]`，bridge 原样回。**两列都没有 HTTP**，
+因为两代 proxy 都不解析 HTTP —— 它只存在于端上和 Mac 上。把它从测量里拿掉，量到
+的才是载体本身。
 
-Reproduce with `bash scripts/bench.sh <PORT_BASE>` (needs both binaries and
-`target/release/harness`; see `scripts/bench.sh` for the exact cases).
+复现：`bash scripts/bench.sh <PORT_BASE>`（需要两个二进制）。
+机器：Apple M4 Pro（14 核 / 48 GB），proxy、bridge、压测端同机回环，**两列都是下限**。
 
-## Results
+## 结果
 
-| case | metric | old | new | delta |
+| 场景 | 指标 | old | new | 对比 |
 |---|---|---:|---:|---:|
-| latency 1 conn | rps | 7 567 | **14 799** | 1.96× |
-| | p50 / p99 | 0.060 / 1.739 ms | 0.064 / 0.120 ms | p99 14× better |
-| | proxy CPU | 0:00.09 | 0:00.13 | +44 % |
-| | proxy RSS | 2 592 KB | 4 416 KB | +1.8 MB |
-| latency 32 conn | rps | **88 418** | 59 665 | 0.67× |
-| | p50 / p99 | 0.329 / 0.869 ms | 0.408 / 1.339 ms | +24 % / +54 % |
-| | proxy CPU | 0:00.58 | 0:02.47 | 4.3× |
-| | proxy RSS | 3 920 KB | 9 120 KB | +5.2 MB |
-| connect | conn/s | 2 894 | **3 964** | 1.37× |
-| | p50 / p99 | 0.331 / 0.457 ms | 0.247 / 0.330 ms | better |
-| | proxy CPU | 0:00.03 | 0:00.05 | +67 % |
-| bulk 256 KiB ×200 | MB/s | **231.9** | 177.4 | 0.76× |
-| | p50 / p99 | 1.054 / 1.329 ms | 1.408 / 1.610 ms | +34 % / +21 % |
-| | proxy RSS | 3 312 KB | 8 560 KB | +5.2 MB |
-| bulk 1 MiB ×64, conc 8 | MB/s | **555.6** | 548.4 | 0.99× |
-| | p50 / p99 | 13.696 / 18.528 ms | 14.312 / 17.731 ms | ≈ equal |
-| | proxy CPU | 0:00.21 | 0:00.32 | +52 % |
-| | proxy RSS | 5 360 KB | 34 512 KB | +29 MB |
-| new proxy + **old** client | rps | — | 15 424 | legacy path unchanged |
+| 4 B 回显，1 连接 | rps | 19 934 | 18 995 | 0.95× |
+| | p50 / p99 | 0.047 / 0.093 ms | 0.049 / 0.094 ms | 持平 |
+| | CPU / RSS | 0:00.41 / 2 592 KB | 0:00.46 / 3 856 KB | +12 % / +1.2 MB |
+| 4 B 回显，32 连接 | rps | 108 799 | 107 647 | **0.99×** |
+| | p50 / p99 | 0.283 / 0.709 ms | 0.283 / 0.648 ms | 持平（p99 略好） |
+| | CPU / RSS | 0:01.18 / 3 696 KB | 0:01.17 / 6 016 KB | **CPU 相同** / +2.3 MB |
+| 建连 | conn/s | 2 094 | 1 384 | 0.66× |
+| | p50 / p99 | 0.386 / 1.751 ms | 0.631 / 2.286 ms | +63 % / +31 % |
+| 64 KiB ×2000 | MB/s | 160.2 | 129.6 | 0.81× |
+| | CPU | 0:00.34 | 0:00.45 | +32 % |
+| 1 MiB ×400，并发 8 | MB/s | 743.9 | 603.3 | 0.81× |
+| | p50 / p99 | 10.3 / 17.3 ms | 12.6 / 23.1 ms | +22 % / +33 % |
+| | CPU / RSS | 0:01.26 / 5 472 KB | 0:01.67 / 12 416 KB | +33 % / +6.9 MB |
 
-## What the numbers say
+## 结论
 
-**Latency throughput wins at 1 connection.** 1.96× the request rate with a
-30× tighter p99. The old path pays for a Noise_IK handshake inside every new
-tunnel; the new pool hands a warm, already-authenticated HTTP/1.1 connection
-back, so most requests never touch the handshake at all.
+**小消息上是平的。** 32 并发下 107 647 对 108 799 rps，CPU 完全相同，p99 还略好。
+RPC 流量就是这个形状，所以把裸 TCP 换成 WSS 在实际负载上不花钱。
 
-**At 32 concurrent connections the old path still wins** on raw rps (88k vs
-60k), and that is the honest cost of the design: the same TLS + bearer
-machinery now runs in-process on every request, where the old proxy only
-copied bytes. The 4.3× CPU figure is the clearest picture of it — the new edge
-does per-request work the old edge never did. A single wide-area RTT dominates
-both of these numbers in production, so the practical difference is small; on
-a busy host, capacity planning should use the CPU column.
+**代价集中在两处，都是按字节或按连接计的：**
 
-**Connection establishment is faster** (3 964 vs 2 894/s) despite adding a TLS
-handshake, because the old path pays a Noise_IK handshake *after* the TCP
-handshake for every connection. TLS 1.3 is one round trip and the proxy now
-owns both halves of it.
+- **大块吞吐 −19 %，CPU +33 %**。每个字节多一遍 TLS AEAD，外加 WebSocket 分帧与
+  掩码。1 MiB×8 时 603 MB/s 对 744 MB/s。在带宽约 0.5 MB/s 的 VPS 上这永远不是
+  瓶颈，但在同机回环上它是真实的。
+- **建连 −34 %**（1 384 对 2 094 conn/s）。多一次 TLS 握手，且不可避免：对外只
+  暴露 HTTPS/WSS 就意味着要终止 TLS。手机端复用一条长连接，所以只在重连时付。
 
-**Bulk throughput is unchanged at scale** (548 vs 556 MB/s at 1 MiB ×8), which
-is the result that matters: streaming both bodies end to end leaves the new
-edge as fast as a blind byte relay at the payload sizes that saturate the
-pipe. The one regression, 256 KiB at concurrency 1, is a single-connection
-effect — one TLS record and one HTTP/1.1 framing pass per 256 KiB request —
-not a systemic one.
+**内存高一档但仍然很小**：大块场景峰值 12.4 MB 对 5.5 MB，多出来的是 TLS 记录与
+WebSocket 分帧缓冲，流量停下即回落。
 
-**Memory is the remaining gap.** 29 MB extra at 1 MiB ×8 is real, but it is
-per-request transient, not a leak: the proxy's resident set returns to ~4.5 MB
-once traffic stops. It is the cost of holding whole response frames in the
-HTTP/1.1 path, and it is bounded by `WINDOW` (256 KiB) × concurrent streams,
-not by request size — a 64 MiB upload no longer grows it, because the body now
-streams instead of being collected.
+## 一处更正
 
-## The 64 KiB boundary (fixed)
+本仓库早先的文档里有一组数字，说新方案在 32 并发下是 106 677 对老方案 88 418 rps。
+**那个对比不成立，已作废。** 当时 old 那列跑的是隧道内的 HTTP/1.1（hyper 在两端
+编解码），new 那列跑的是裸分帧回显 —— 多出来的开销记在了 old 头上，让新方案显得
+更快。本页两列用同一套分帧，结论因此从「新的更快」变成「小消息持平，大块和建连
+更慢」。
 
-The first matrix run had `old-bulk-*` failing outright at every size from
-64 KiB up. It was not a proxy limit: at 65 504 bytes the request reaches the
-proxy as one maximum-size (65 535-byte) Noise message followed by a small one,
-and the reader asked the socket for *more* ciphertext while a complete message
-already sat in its buffer. The socket had gone quiet on the message boundary,
-so the read hung until the harness deadline.
-
-`NoiseStream::poll_read` now drains a buffered complete message before reading
-more, which fixes the old client path and the new one alike — the new client
-was hitting the same stall at large enough bodies. Regression:
-`a_complete_buffered_message_is_read_without_more_ciphertext` in
-`tests/edge.rs`.
-
-## Security delta (not measured, and the reason for the design)
-
-The old proxy could not decrypt application traffic at all: Noise_IK ran end
-to end, phone to Mac. The unified edge terminates TLS and runs Noise_IK
-itself, so the proxy is now inside the trust boundary and can see plaintext.
-That is the deliberate trade for one uniform contract that a WeChat
-mini-program can speak (HTTPS/WSS only, no raw TCP, no Noise). See the
-architecture notes in `README.md`.
+真正值钱的结论没有变，只是它属于另一个对比：**proxy 逐请求再发起 HTTP
+（59 665 rps / 2.47 s CPU）远贵于字节转发**。最终方案选的是字节转发，所以它才能
+追平裸 TCP。

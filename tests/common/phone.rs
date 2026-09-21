@@ -197,11 +197,18 @@ pub async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Bytes> {
 }
 
 /// Write one `[u16 len][data]` frame. Handshake only.
+///
+/// The flush is not optional. A handshake message is small, and both carriers
+/// under it buffer: the mux coalesces to 32 KiB, and the WebSocket stages
+/// frames until something drains them. Without this the peer waits for a
+/// reply that is sitting in a buffer, and the only thing that eventually
+/// happens is the proxy's 90-second idle timer.
 pub async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, body: &[u8]) -> Result<()> {
     let mut out = Vec::with_capacity(body.len() + 2);
     out.extend_from_slice(&(body.len() as u16).to_be_bytes());
     out.extend_from_slice(body);
-    stream.write_all(&out).await
+    stream.write_all(&out).await?;
+    stream.flush().await
 }
 
 fn invalid(error: impl std::fmt::Display) -> Error {

@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 pub mod phone;
+pub mod wsio;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

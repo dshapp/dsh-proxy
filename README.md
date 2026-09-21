@@ -90,8 +90,17 @@ proxy, which is what makes these evidence rather than a mirror.
 
 ## Measured
 
-Against the previous bare-TCP proxy, same bridge and same load generator, at
-32 concurrent connections: **106 677 rps versus 88 418**, at 1.04 s of proxy
-CPU. Adding TLS and WebSocket framing costs far less than re-originating an
-HTTP request per call. Method and full numbers:
-[BENCHMARKS-SHAPES.md](BENCHMARKS-SHAPES.md).
+Against the previous bare-TCP proxy, same bridge, same phone stack, same
+payloads, with only the carrier different:
+
+| | old | new |
+|---|---:|---:|
+| 4 B echo, 32 connections | 108 799 rps | **107 647 rps**, same CPU |
+| 1 MiB bulk, 8 lanes | 743.9 MB/s | 603.3 MB/s, +33 % CPU |
+| connection setup | 2 094/s | 1 384/s |
+
+So the shape that actually carries RPC is free, and what TLS and WebSocket
+framing cost is paid per byte and per connection: a fifth of the bulk
+throughput, and a third of the connection rate. On a link that tops out
+around 0.5 MB/s neither is the limit. Method, caveats and a correction to an
+earlier unfair comparison: [BENCHMARKS.md](BENCHMARKS.md).
