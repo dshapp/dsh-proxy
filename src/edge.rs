@@ -162,13 +162,16 @@ impl Edge {
             None => return Ok(fail(StatusCode::UNAUTHORIZED, "missing or unknown bearer token")),
         };
 
-        if path == "/api/remote.mux" && is_upgrade(&req) {
+        if !path.starts_with("/api/") {
+            return Ok(fail(StatusCode::NOT_FOUND, "no such route"));
+        }
+        // Any /api upgrade is spliced, whatever it is. The proxy deliberately
+        // knows no route names: the bridge's own allowlist decides which
+        // sockets exist, so adding one there needs no change here.
+        if is_upgrade(&req) {
             return Ok(self.upgrade(route, req).await);
         }
-        if path.starts_with("/api/") {
-            return Ok(self.forward(route, req).await);
-        }
-        Ok(fail(StatusCode::NOT_FOUND, "no such route"))
+        Ok(self.forward(route, req).await)
     }
 
     /// Resolve the bearer token to a device handle, if it is valid.
@@ -249,6 +252,7 @@ impl Edge {
         let (parts, body) = req.into_parts();
         let mut headers = parts.headers.clone();
         strip_hop(&mut headers);
+        let target_path = parts.uri.path().to_string();
         let target = parts
             .uri
             .path_and_query()
@@ -278,6 +282,9 @@ impl Edge {
             Ok(lease) => lease,
             Err(error) => return fail(StatusCode::BAD_GATEWAY, &error.to_string()),
         };
+        if is_bulk(&target_path) {
+            lease.close_when_done();
+        }
         let upstream = match lease.sender().send_request(upstream).await {
             Ok(response) => response,
             Err(error) => {
@@ -373,6 +380,16 @@ fn strip_hop_ws(headers: &mut HeaderMap) {
     }
     headers.insert(CONNECTION, hyper::header::HeaderValue::from_static("Upgrade"));
     headers.insert(UPGRADE, hyper::header::HeaderValue::from_static("websocket"));
+}
+
+/// Routes whose bodies are files rather than arguments.
+///
+/// These are the bridge's own streaming routes. They are named here only to
+/// decide tunnel lifetime — the proxy does not treat their contents
+/// differently, and a route missing from this list still works, it just parks
+/// its tunnel for reuse like an RPC call.
+fn is_bulk(path: &str) -> bool {
+    matches!(path, "/api/file" | "/api/session/uploadFileBinary")
 }
 
 /// Whether a request asks to switch protocols.

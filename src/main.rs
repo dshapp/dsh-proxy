@@ -37,6 +37,9 @@ async fn main() -> Result<()> {
                 tunnels_per_device = positive(&mut args, "--max-tunnels-per-device")
             }
             "--max-bridges" => limits.max_bridges = positive(&mut args, "--max-bridges"),
+            "--max-clients-per-ip" => {
+                limits.max_clients_per_ip = positive(&mut args, "--max-clients-per-ip")
+            }
             "--max-bridges-per-ip" => {
                 limits.max_bridges_per_ip = positive(&mut args, "--max-bridges-per-ip")
             }
@@ -53,7 +56,8 @@ async fn main() -> Result<()> {
                      \t[--tls-cert PEM] [--tls-key PEM] [--tls-self-signed]\n\
                      \t[--state FILE] [--max-tunnels-per-device N]\n\
                      \t[--max-bridges N] [--max-bridges-per-ip N]\n\
-                     \t[--max-streams-per-bridge N] [--handshake-timeout-ms N]"
+                     \t[--max-streams-per-bridge N] [--handshake-timeout-ms N]\n\
+                     \t[--max-clients-per-ip N]"
                 );
                 return Ok(());
             }

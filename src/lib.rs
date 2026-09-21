@@ -56,6 +56,13 @@ pub struct Limits {
     pub max_streams_per_bridge: usize,
     /// Deadline for the whole Noise_XX handshake, not just the preamble.
     pub handshake_timeout: Duration,
+    /// Most TLS client connections one peer address may hold at once.
+    ///
+    /// Client traffic is authenticated, but only *after* TLS and only by a
+    /// token the bridge issued. This ceiling is what stops an unauthenticated
+    /// peer from spending the proxy's sockets, and it is deliberately cheap:
+    /// no decryption, no lookup, one counter per address.
+    pub max_clients_per_ip: usize,
 }
 
 impl Default for Limits {
@@ -65,6 +72,7 @@ impl Default for Limits {
             max_bridges_per_ip: 32,
             max_streams_per_bridge: MAX_STREAMS_PER_BRIDGE,
             handshake_timeout: Duration::from_secs(10),
+            max_clients_per_ip: 64,
         }
     }
 }
@@ -75,6 +83,10 @@ impl Default for Limits {
 /// these into `serve_bridge`, so the count cannot drift from reality even when
 /// a task is cancelled or panics on the way out.
 type BridgesPerIp = Arc<DashMap<IpAddr, usize>>;
+
+/// TLS client connections currently held per peer address. Same guard, same
+/// drift-free accounting, different ceiling.
+type ClientsPerIp = Arc<DashMap<IpAddr, usize>>;
 
 /// Holds one per-IP bridge slot until dropped.
 struct IpSlot {
@@ -141,12 +153,14 @@ pub async fn run_edge(
 ) -> Result<()> {
     let table = edge.table.clone();
     let per_ip: BridgesPerIp = Arc::new(DashMap::new());
+    let clients_per_ip: ClientsPerIp = Arc::new(DashMap::new());
     let budget = Arc::new(Semaphore::new(limits.max_bridges));
     loop {
         let (socket, peer) = listener.accept().await?;
         let _ = socket.set_nodelay(true);
         let table = table.clone();
         let per_ip = per_ip.clone();
+        let clients_per_ip = clients_per_ip.clone();
         let budget = budget.clone();
         let private = private.clone();
         let edge = edge.clone();
@@ -160,6 +174,13 @@ pub async fn run_edge(
                 }
             };
             if tls {
+                // Claimed before the handshake, so a peer opening sockets it
+                // never authenticates on still hits the ceiling.
+                let Some(_slot) =
+                    IpSlot::claim(&clients_per_ip, peer.ip(), limits.max_clients_per_ip)
+                else {
+                    return;
+                };
                 edge.serve(socket).await;
             } else {
                 let _ = serve(socket, peer.ip(), table, per_ip, budget, private, limits).await;

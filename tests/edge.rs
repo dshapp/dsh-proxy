@@ -359,6 +359,98 @@ async fn websocket_upgrade_is_spliced_to_the_bridge() {
     assert_eq!(&echoed, b"spliced bytes");
 }
 
+/// The proxy knows no socket route names: any /api upgrade is spliced, so the
+/// bridge can add a socket (the RPC pipe) without a proxy change.
+#[tokio::test]
+async fn any_api_upgrade_is_spliced_not_just_the_known_one() {
+    let (addr, cert) = start_edge().await;
+    let bridge = attach(addr, Behaviour::Upgrade).await;
+    let token = pair(addr, &cert, bridge.key).await;
+
+    let connector = tokio_rustls::TlsConnector::from(tls::client_config_trusting(cert.clone()));
+    let socket = TcpStream::connect(addr).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = connector.connect(name, socket).await.unwrap();
+    // A route the proxy has never heard of.
+    let request = format!(
+        "GET /api/rpc.mux HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+         Upgrade: websocket\r\nAuthorization: Bearer {token}\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        tls.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head);
+    assert!(text.starts_with("HTTP/1.1 101"), "no 101: {text}");
+
+    tls.write_all(b"rpc frame").await.unwrap();
+    let mut echoed = [0u8; 9];
+    tokio::time::timeout(Duration::from_secs(10), tls.read_exact(&mut echoed))
+        .await
+        .expect("splice timed out")
+        .unwrap();
+    assert_eq!(&echoed, b"rpc frame");
+}
+
+/// An RPC call parks its tunnel for reuse; a bulk route does not, so a file
+/// transfer never leaves a large-buffered tunnel sitting in the idle pool.
+///
+/// Counting tunnels the bridge accepted is the probe, and the telling step is
+/// the last one: an RPC after a bulk call has to build a tunnel, because the
+/// bulk call closed the one it borrowed instead of parking it.
+#[tokio::test]
+async fn bulk_routes_do_not_park_their_tunnel() {
+    let (addr, cert) = start_edge().await;
+    let bridge = attach(addr, Behaviour::Echo).await;
+    let token = pair(addr, &cert, bridge.key).await;
+    let mut sender = connect_client(addr, &cert).await;
+
+    async fn call(
+        sender: &mut hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+        token: &str,
+        path: &str,
+    ) {
+        let response = sender
+            .send_request(api(path, token, Bytes::from_static(b"x")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let _ = response.into_body().collect().await.unwrap();
+        // The lease returns when the response body is dropped, one task hop
+        // after `collect` resolves.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    call(&mut sender, &token, "/api/session/echo").await;
+    let after_first = bridge.accepted().await;
+
+    call(&mut sender, &token, "/api/session/echo").await;
+    assert_eq!(
+        bridge.accepted().await,
+        after_first,
+        "a second RPC must reuse the parked tunnel"
+    );
+
+    call(&mut sender, &token, "/api/session/uploadFileBinary").await;
+    assert_eq!(
+        bridge.accepted().await,
+        after_first,
+        "a bulk call may borrow a parked tunnel"
+    );
+
+    call(&mut sender, &token, "/api/session/echo").await;
+    assert_eq!(
+        bridge.accepted().await,
+        after_first + 1,
+        "the bulk call must have closed the tunnel rather than parking it"
+    );
+}
+
 /// Regression: a transport message that arrives complete in one burst and then
 /// leaves the socket quiet must still be readable.
 ///

@@ -136,6 +136,8 @@ pub struct Lease {
     slot: Arc<Mutex<Vec<Conn>>>,
     cap: usize,
     live: Arc<AtomicUsize>,
+    /// Whether this tunnel may be parked for reuse when the lease ends.
+    reusable: bool,
 }
 
 impl Pool {
@@ -230,6 +232,7 @@ impl Pool {
                 slot,
                 cap: self.per_device,
                 live: self.live.clone(),
+                reusable: true,
             });
         }
 
@@ -240,6 +243,7 @@ impl Pool {
             slot,
             cap: self.per_device,
             live: self.live.clone(),
+            reusable: true,
         })
     }
 
@@ -288,6 +292,16 @@ impl Lease {
     pub fn discard(&mut self) {
         self.sender = None;
     }
+
+    /// Close this tunnel when the lease ends rather than parking it.
+    ///
+    /// A bulk transfer leaves a tunnel holding large buffers and a bridge
+    /// stream slot for as long as the idle timeout. Those are worth keeping
+    /// for a chatty RPC connection and not for a one-off file, so bulk routes
+    /// take a tunnel and give it back to the operating system.
+    pub fn close_when_done(&mut self) {
+        self.reusable = false;
+    }
 }
 
 impl Drop for Lease {
@@ -298,7 +312,7 @@ impl Drop for Lease {
             self.live.fetch_sub(1, Ordering::Relaxed);
             return;
         };
-        if sender.is_closed() {
+        if sender.is_closed() || !self.reusable {
             self.live.fetch_sub(1, Ordering::Relaxed);
             return;
         }
